@@ -6,9 +6,8 @@
 
 > **一键安装：**
 > ```
-> dsh plugin --profile web add <仓库或本地路径>
+> dsh plugin add qwert702/dsh-continue-on-limitout
 > ```
-> 例如本地路径：`dsh plugin --profile web add D:\CBN-HT\Desktop\AI编程\dsh插件\dsh-continue-on-limit`
 > 装完重启 harness（`dsh web`）、刷新页面即可生效。插件完全隐形，不占用任何界面空间。
 
 ## 功能
