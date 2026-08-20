@@ -1,0 +1,33 @@
+{
+  "name": "dsh-continue-on-limit",
+  "version": "0.1.0",
+  "description": "Auto-continue for the DeepSeek Harness Web GUI: when a small local model hits its output-token cap and the conversation shows the max-tokens notice, the plugin automatically sends a short \"continue\" message so the reply keeps flowing without a manual click.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "dsh-continue-on-limit.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/smoke.cjs"
+  },
+  "license": "MIT"
+}
