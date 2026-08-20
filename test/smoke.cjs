@@ -3,11 +3,13 @@
 // 2. Host half: apply() registers the GET /api/dsh-continue-on-limit/config
 //    route; the handler resolves the settings namespace (defaults when the
 //    namespace is absent, overrides when configured) and rejects non-GET verbs.
-// 3. Client bundle: the additive header.actions registration, the pure
-//    auto-continue policy across every branch (disabled / busy / queued /
-//    no-notice / not-tail / handled / cooldown / cap / send), the chain-reset
-//    policy (human message / completed turn / our own continue), loadConfig
-//    against a mocked fetch, and the SSR null render.
+// 3. Client bundle: the additive header.actions registration + the plugin's OWN
+//    max-tokens chat-node definition (registered on conversationEvents, null
+//    view on conversation.chat.node), the pure detection across every branch
+//    (disabled / busy / queued / no-notice / not-tail / handled / cooldown /
+//    cap / send) with the dual source (legacy nodes + chat snapshot), the
+//    chain-reset policy, loadConfig against a mocked fetch, and the SSR null
+//    render.
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -106,9 +108,6 @@ async function hostTests() {
 async function clientTests() {
   const react = require(path.join(harnessModules, 'react'));
   const jsxRuntime = require(path.join(harnessModules, 'react/jsx-runtime'));
-  const webReactShim = {
-    bindSnapshotSelector: (store) => (selector) => selector(store.getSnapshot()),
-  };
 
   const loader = {};
   global.window = {
@@ -118,7 +117,6 @@ async function clientTests() {
         loader.exports = entry.factory((spec) => {
           if (spec === 'react') return react;
           if (spec === 'react/jsx-runtime') return jsxRuntime;
-          if (spec === '@deepseek-ai/dsh-client-web-react') return webReactShim;
           throw new Error('unexpected require: ' + spec);
         });
       },
@@ -137,13 +135,22 @@ async function clientTests() {
   }
   console.log('OK: client bundle loads, inject slots+sessions');
 
-  // registration: one additive entry on the header.actions list seat
+  // registration: own max-tokens definition + null view + header.actions entry
+  const registeredDefinitions = [];
   const entries = [];
   const ctx = {
-    get: (name) => (name === 'sessions' ? sessionsMock : undefined),
+    get: (name) => {
+      if (name === 'sessions') return sessionsMock;
+      if (name === 'conversationEvents') return {
+        register(def) { registeredDefinitions.push(def); return () => {}; },
+      };
+      return undefined;
+    },
     slots: {
       inject(key, factory) {
-        if (key !== 'conversation.session.header.actions') throw new Error('wrong injected seat: ' + key);
+        if (key !== 'conversation.chat.node' && key !== 'conversation.session.header.actions') {
+          throw new Error('wrong injected seat: ' + key);
+        }
         const registerCall = factory();
         registerCall();
         return () => {};
@@ -161,21 +168,39 @@ async function clientTests() {
     binding: () => undefined,
   };
   client.apply(ctx);
-  const actionEntries = entries.filter((e) => e.opts.name === 'conversation.session.header.actions');
-  if (actionEntries.length !== 1) throw new Error('expected one header.actions entry, got ' + actionEntries.length);
-  const action = actionEntries[0];
-  if (action.opts.id !== 'continue-on-limit') throw new Error('wrong header action id: ' + action.opts.id);
-  if (action.opts.priority !== 10) throw new Error('wrong header action priority');
-  console.log('OK: client registers the header.actions chain entry');
 
-  // --- evaluate() policy branches ---
+  const definition = registeredDefinitions[0];
+  if (definition === undefined) throw new Error('own max-tokens definition not registered');
+  if (definition.kind !== 'continue-max-tokens') throw new Error('wrong definition kind: ' + definition.kind);
+  if (definition.target !== 'chat') throw new Error('wrong definition target: ' + definition.target);
+  const matched = definition.match({ type: 'turn/end', seq: 200, time: 1, data: { turn: 4, reason: { kind: 'max-tokens' } } });
+  if (matched === null || matched.id !== '4' || matched.role !== 'start') throw new Error('definition match wrong: ' + JSON.stringify(matched));
+  if (definition.match({ type: 'turn/end', seq: 201, time: 1, data: { turn: 5, reason: { kind: 'stop' } } }) !== null) throw new Error('definition matched a non-max-tokens turn/end');
+  if (definition.match({ type: 'assistant/message', seq: 202, time: 1, data: {} }) !== null) throw new Error('definition matched a non-turn/end event');
+  const state = definition.start({}, { event: { type: 'turn/end', seq: 200, time: 1, data: { turn: 4, reason: { kind: 'max-tokens' } } } });
+  if (state.turn !== 4 || state.seq !== 200) throw new Error('definition start state wrong: ' + JSON.stringify(state));
+  const built = definition.buildViewNode({ state, key: 'k-1', id: '4', start: { location: { kind: 'turn', turn: {} } }, matches: [] });
+  if (built.kind !== 'continue-max-tokens' || built.visibility !== 'hidden' || built.data.seq !== 200 || built.data.turn !== 4) {
+    throw new Error('definition buildViewNode wrong: ' + JSON.stringify(built));
+  }
+  const nullView = entries.find((e) => e.opts.name === 'conversation.chat.node' && e.opts.key === 'continue-max-tokens');
+  if (nullView === undefined) throw new Error('null view for continue-max-tokens not registered');
+  const action = entries.find((e) => e.opts.name === 'conversation.session.header.actions');
+  if (action === undefined) throw new Error('header.actions entry not registered');
+  if (action.opts.id !== 'continue-on-limit' || action.opts.priority !== 10) throw new Error('wrong header action opts: ' + JSON.stringify(action.opts));
+  console.log('OK: client registers own max-tokens definition, null view, and header.actions entry');
+
+  // --- collectNoticeCandidates + evaluate() policy branches ---
   const config = { enabled: true, continueText: '继续', maxConsecutive: 3, minIntervalMs: 1500 };
   const notice = { kind: 'turn-max-tokens', seq: 100.05, time: 1, turn: 2, step: 0 };
+  const ownNotice = { kind: 'continue-max-tokens', seq: 100, time: 1, turn: 2, step: 0 };
   const frozen = { kind: 'assistant', seq: 99.1, time: 1, turn: 2, step: 0, blocks: [], interrupted: true };
   const userMsg = { kind: 'user', seq: 0, time: 0, content: [{ type: 'text', text: '写一个脚本' }], source: {} };
+  const chatNodes = (nodes) => ({ nodes: { values: () => nodes } });
   const baseSnapshot = {
     sessionId: 'session-1',
     nodes: [userMsg, frozen, notice],
+    chat: chatNodes([]),
     queue: [],
     pending: [],
     running: false,
@@ -198,10 +223,10 @@ async function clientTests() {
   if (verdict.action !== 'queued') throw new Error('queued branch: ' + JSON.stringify(verdict));
   verdict = client.evaluate({ ...baseSnapshot, pending: [{ id: 'p-1' }] }, freshState(), config, 1000);
   if (verdict.action !== 'queued') throw new Error('pending branch: ' + JSON.stringify(verdict));
-  // no notice
-  verdict = client.evaluate({ ...baseSnapshot, nodes: [userMsg, frozen] }, freshState(), config, 1000);
+  // no notice (neither source)
+  verdict = client.evaluate({ ...baseSnapshot, nodes: [userMsg, frozen], chat: chatNodes([]) }, freshState(), config, 1000);
   if (verdict.action !== 'no-notice') throw new Error('no-notice branch: ' + JSON.stringify(verdict));
-  // notice not the tail (a later user message exists)
+  // notice not the tail (a later user message exists in the visible flow)
   verdict = client.evaluate({ ...baseSnapshot, nodes: [userMsg, frozen, notice, { ...userMsg, seq: 120, content: [{ type: 'text', text: '再写一个' }] }] }, freshState(), config, 1000);
   if (verdict.action !== 'not-tail') throw new Error('not-tail branch: ' + JSON.stringify(verdict));
   // handled
@@ -217,6 +242,36 @@ async function clientTests() {
   verdict = client.evaluate(baseSnapshot, freshState(), config, 10000);
   if (verdict.action !== 'send' || verdict.notice !== notice) throw new Error('send branch: ' + JSON.stringify(verdict));
   console.log('OK: evaluate() covers every branch');
+
+  // --- dual-source detection ---
+  // The harness's own turn-max-tokens lives only in the chat snapshot (older
+  // ui-conversation without the legacy projection case): still detected.
+  const chatOnlyNotice = { ...notice, seq: 100 };
+  let chatSnapshot = { ...baseSnapshot, nodes: [userMsg, frozen], chat: chatNodes([{ kind: 'turn-max-tokens', data: chatOnlyNotice }]) };
+  verdict = client.evaluate(chatSnapshot, freshState(), config, 10000);
+  if (verdict.action !== 'send' || verdict.notice.seq !== 100) throw new Error('chat-only notice not detected: ' + JSON.stringify(verdict));
+  // The plugin's OWN node fires when the harness ships no turn-max-tokens at
+  // all (legacy flow ends at the frozen assistant, seq < own notice seq).
+  const ownSnapshot = { ...baseSnapshot, nodes: [userMsg, frozen], chat: chatNodes([{ kind: 'continue-max-tokens', data: ownNotice }]) };
+  verdict = client.evaluate(ownSnapshot, freshState(), config, 10000);
+  if (verdict.action !== 'send' || verdict.notice !== ownNotice) throw new Error('own definition not detected: ' + JSON.stringify(verdict));
+  // ... but a human message after the truncation still blocks it.
+  const humanAfter = { ...baseSnapshot, nodes: [userMsg, frozen, { ...userMsg, seq: 150, content: [{ type: 'text', text: '我自己来' }] }], chat: chatNodes([{ kind: 'continue-max-tokens', data: ownNotice }]) };
+  verdict = client.evaluate(humanAfter, freshState(), config, 10000);
+  if (verdict.action !== 'not-tail') throw new Error('human after own notice must block: ' + JSON.stringify(verdict));
+  // Dedup: the same truncation surfacing in both sources produces ONE candidate.
+  const both = { ...baseSnapshot, nodes: [userMsg, frozen, notice], chat: chatNodes([
+    { kind: 'turn-max-tokens', data: notice },
+    { kind: 'continue-max-tokens', data: { ...ownNotice, seq: 100 } },
+  ]) };
+  const candidates = client.collectNoticeCandidates(both);
+  const seqs = candidates.map((c) => c.seq).sort((a, b) => a - b);
+  if (candidates.length !== 2 || seqs[0] !== 100 || seqs[1] !== 100.05) {
+    throw new Error('candidate dedup wrong: ' + JSON.stringify(seqs));
+  }
+  verdict = client.evaluate(both, freshState(), config, 10000);
+  if (verdict.action !== 'send') throw new Error('both-sources snapshot must send once: ' + JSON.stringify(verdict));
+  console.log('OK: dual-source detection + dedup');
 
   // --- evaluateReset() ---
   // our own auto-continue message must NOT reset the chain

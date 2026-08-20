@@ -6,7 +6,7 @@
 
 > **一键安装：**
 > ```
-> dsh plugin add qwert702/dsh-continue-on-limitout
+> dsh plugin add qwert702/dsh-continue-on-limit
 > ```
 > 装完重启 harness（`dsh web`）、刷新页面即可生效。插件完全隐形，不占用任何界面空间。
 
@@ -21,9 +21,23 @@
 ## 工作原理
 
 1. 插件挂载在会话头部坐席 `conversation.session.header.actions`（与 dsh-context-compressor 同一条链），但渲染为空，只订阅当前会话的快照。
-2. harness 端 `turn/end` 事件带 `reason.kind === "max-tokens"` 时，UI 会落一条 `turn-max-tokens` 通知节点——这正是界面上「已达到输出 token 上限」提示的数据来源。
-3. 快照里该节点出现在对话尾部时，插件通过会话面的 `prompt([{ type: 'text', text: '继续' }], 'queue')` 发送继续消息，与输入框手动发送走同一条通道。
+2. harness 端 `turn/end` 事件带 `reason.kind === "max-tokens"` 时，UI 会落一条「已达到输出 token 上限」提示——插件用**双源检测**，两条路都认：
+   - **快照检测**：会话快照里的 `turn-max-tokens` 节点（harness 的 ui-conversation 提供，`snapshot.nodes` 与 `snapshot.chat` 两处都读）；
+   - **自注册检测**：插件自己向 `conversationEvents` 注册一个 `continue-max-tokens` 定义，直接匹配 `turn/end` + `reason.kind === "max-tokens"` 事件（节点隐藏、永不渲染）。即使某个版本的 harness 没有 ui-conversation 的 `turn-max-tokens` 定义，插件照样能检测到截断。
+3. 截断处于对话可见流的**尾部**（截断之后没有更新的用户消息/回合）且会话空闲时，插件通过会话面的 `prompt([{ type: 'text', text: '继续' }], 'queue')` 发送继续消息，与输入框手动发送走同一条通道。
 4. 模型接着输出；若再次截断则再次自动继续，直到完成、用户介入或达到连续次数上限。
+
+## 诊断（插件不触发时先看这里）
+
+插件完全隐形，但挂载时会往浏览器控制台打一行日志：
+
+```
+[dsh-continue-on-limit] 观察器已挂载：turn-max-tokens(flow/chat)=0/0，自有定义=0
+```
+
+- **看不到这行日志** → 客户端半区没加载（安装/重启问题），先确认插件装过、harness 已重启、页面已刷新。
+- **能看到但计数全为 0** → 检测源在当前 harness 里都不存在，且会话还没有截断记录；等一次真实截断后再看。
+- **截断发生后计数 > 0 但仍不自动发送** → 通常是「截断不是对话尾部」（截断后你又发了消息）或连续自动继续已达上限，浏览器控制台会有对应的 warn 日志。
 
 ## 设置（可选）
 
@@ -42,13 +56,13 @@ dsh-continue-on-limit:
 ## 仓库布局
 
 - `lib/index.js` — 插件 host 半区：设置命名空间 + `GET /api/dsh-continue-on-limit/config` 配置读取路由。
-- `lib/client.js` — 浏览器半区：纯策略函数（`evaluate` / `evaluateReset`）+ 隐形观察组件（订阅会话快照、自动发送继续）。
-- `test/smoke.cjs` — `node test/smoke.cjs`：host 路由全路径（默认值/覆盖值/405）+ client 注册与 SSR 空渲染断言 + 策略全分支（禁用/忙碌/排队/无提示/非尾部/已处理/冷却/达上限/发送）+ 链重置逻辑 + 配置读取回退。
+- `lib/client.js` — 浏览器半区：纯策略函数（`collectNoticeCandidates` / `evaluate` / `evaluateReset`，双源检测）+ 自注册的 `continue-max-tokens` 节点定义 + 隐形观察组件（订阅会话快照、自动发送继续）。
+- `test/smoke.cjs` — `node test/smoke.cjs`：host 路由全路径（默认值/覆盖值/405）+ client 注册（自注册定义/空视图/坐席条目）与 SSR 空渲染断言 + 检测全分支（禁用/忙碌/排队/无提示/非尾部/已处理/冷却/达上限/发送）+ 双源去重 + 链重置逻辑 + 配置读取回退。
 
 ## 已知限制
 
 - **只作用于打开中的会话**：插件订阅的是当前展示（staged）的会话，切到别的会话时只对该会话生效——这符合使用直觉：你在看哪个会话，哪个会话才会被自动继续。
-- **提示必须处于尾部**：如果截断提示之后用户已经发了新消息，插件不会去追发「继续」（此时继续的意义已经变了，用户正在主导对话）。
+- **截断必须处于对话尾部**：如果截断之后用户已经发了新消息，插件不会去追发「继续」（此时继续的意义已经变了，用户正在主导对话）。
 - **无法区分手动「继续」**：如果用户恰好手动发送了与 `continueText` 相同的文字，插件会把它当作自己发的，不重置连续计数——最多让自动继续提前一轮停手，无其他影响。
 - **配置读取一次**：浏览器半区在页面加载时读取一次配置，改设置需刷新页面（host 端每次请求都实时解析，但浏览器端不轮询）。
 - **浏览器半区手动维护**：`lib/client.js` 为手写 bundle（与 dsh-context-compressor / dsh-auto-translate 同一技术路线），不经过构建步骤；改动后直接生效，冒烟测试兜底。
