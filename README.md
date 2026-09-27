@@ -1,71 +1,163 @@
-# dsh-continue-on-limit
+# dsh-continue-on-limit-host
 
-本地小模型「输出达到上限」自动继续插件，面向 **DeepSeek Harness Web GUI**。
+面向 **DeepSeek Harness / DSH 0.1.7-rc.2** 的 Host 侧全局自动续写插件。
 
-本地部署的模型输出 token 上限往往设得比较保守，回答到一半就截断——界面上出现「已达到输出 token 上限」的提示，得手动发送一次「继续」才能接着输出。本插件在检测到该提示出现时，**自动发送「继续」**，让回复自动接上，不用盯着界面手动点。
+当模型因为单次输出上限结束，Harness 最终会写入：
 
-> **一键安装：**
-> ```
-> dsh plugin add qwert702/dsh-continue-on-limit
-> ```
-> 装完重启 harness（`dsh web`）、刷新页面即可生效。插件完全隐形，不占用任何界面空间。
+```text
+provider finish_reason = length
+  -> llm-pi-ai stopReason = length
+  -> FinishReason { kind: "max-tokens" }
+  -> turn/end.reason.kind = "max-tokens"
+```
+
+本插件直接在 Host 监听最后这个 `turn/end` 事件，并向同一个 live Agent 排队一条 `followup("继续")`。因此它不再依赖当前浏览器正在展示的 staged session：**后台已加载的主会话即使没有打开在页面上，也可以继续运行。**
+
+## 与原版的主要区别
+
+原版 `dsh-continue-on-limit` 把观察器挂在 Web Client 的 `conversation.session.header.actions`，通过当前页面的 `useSession()` 检测 `turn-max-tokens`，所以只能作用于当前打开的会话。
+
+这个 fork 改为：
+
+```text
+Host: session/event
+       |
+       +-- turn/end.reason.kind === "max-tokens"
+               |
+               +-- ctx.agents.get(session.id)
+                       |
+                       +-- agent.followup("继续")
+```
+
+检测依据仍然是 Harness 自己的 `max-tokens` 链路，不统计 token，也不解析页面上的中文提示。
 
 ## 功能
 
-- **自动继续**：会话出现「已达到输出 token 上限」提示（数据层是 `turn-max-tokens` 节点）时，自动以 `queue` 模式发送配置好的继续文字（默认「继续」），模型自动接着输出。
-- **不打断用户**：只在提示是会话**最后一条**且会话空闲（没有正在回复、没有排队消息）时触发；用户中途发了新消息或自己操作了，就不会被插件打扰。
-- **防死循环烧 token**：模型如果一直输出就截断，插件最多连续自动继续 `maxConsecutive` 次（默认 3）就停下，避免无限烧 token；模型正常完成一次回复或用户插话后，计数自动重置。
-- **防重复发送**：同一条提示只处理一次；两次自动发送之间至少间隔 `minIntervalMs`（默认 1500ms）。
-- **全自动、无 UI**：插件不渲染任何按钮或提示，仅在控制台打印操作日志（`[dsh-continue-on-limit] …`），方便排查。
+- Host 全局检测 `turn/end.reason.kind === "max-tokens"`。
+- 支持后台 live 主会话，不要求该会话正在 Web UI 中打开。
+- 如果 turn 结束后已有用户或其他插件工作排队，不抢在它们前面发送“继续”。
+- 每个 Session 独立维护连续续写次数和发送间隔。
+- 正常结束、报错结束等非 `max-tokens` 轮次，或新的真人输入，会重置连续计数。
+- `maxConsecutive = 0` 可关闭次数上限。
+- Subagent 默认不自动续写，避免干扰 Harness 自己的子代理 continuation 协议；可在配置中显式开启。
+- DSH 0.1.7 新版 Plugins 页面内置配置 UI，保存后通过 `.volatile()` 热更新，无需重启插件实例。
 
-## 工作原理
+## 安装
 
-1. 插件挂载在会话头部坐席 `conversation.session.header.actions`（与 dsh-context-compressor 同一条链），但渲染为空，只订阅当前会话的快照。
-2. harness 端 `turn/end` 事件带 `reason.kind === "max-tokens"` 时，UI 会落一条「已达到输出 token 上限」提示——插件用**双源检测**，两条路都认：
-   - **快照检测**：会话快照里的 `turn-max-tokens` 节点（harness 的 ui-conversation 提供，`snapshot.nodes` 与 `snapshot.chat` 两处都读）；
-   - **自注册检测**：插件自己向 `conversationEvents` 注册一个 `continue-max-tokens` 定义，直接匹配 `turn/end` + `reason.kind === "max-tokens"` 事件（节点隐藏、永不渲染）。即使某个版本的 harness 没有 ui-conversation 的 `turn-max-tokens` 定义，插件照样能检测到截断。
-3. 截断处于对话可见流的**尾部**（截断之后没有更新的用户消息/回合）且会话空闲时，插件通过会话面的 `prompt([{ type: 'text', text: '继续' }], 'queue')` 发送继续消息，与输入框手动发送走同一条通道。
-4. 模型接着输出；若再次截断则再次自动继续，直到完成、用户介入或达到连续次数上限。
+### 直接从 GitHub 安装（不需要发布 npm）
 
-## 诊断（插件不触发时先看这里）
+DSH 官方插件管理器支持 Git 仓库作为安装源，npm 发布不是必需条件：
 
-插件完全隐形，但挂载时会往浏览器控制台打一行日志：
-
-```
-[dsh-continue-on-limit] 观察器已挂载：turn-max-tokens(flow/chat)=0/0，自有定义=0
+```powershell
+dsh plugin --profile web add github:Soulize/dsh-continue-on-limit-host
 ```
 
-- **看不到这行日志** → 客户端半区没加载（安装/重启问题），先确认插件装过、harness 已重启、页面已刷新。
-- **能看到但计数全为 0** → 检测源在当前 harness 里都不存在，且会话还没有截断记录；等一次真实截断后再看。
-- **截断发生后计数 > 0 但仍不自动发送** → 通常是「截断不是对话尾部」（截断后你又发了消息）或连续自动继续已达上限，浏览器控制台会有对应的 warn 日志。
+安装或更新 Bundle 后重启对应 profile：
 
-## 设置（可选）
+```powershell
+dsh web --profile web
+```
 
-在 `~/.dsh/settings.yaml` 添加命名空间 `dsh-continue-on-limit`：
+如果之前安装了原版 `dsh-continue-on-limit`，建议先移除，避免两个自动续写插件同时工作：
+
+```powershell
+dsh plugin --profile web remove dsh-continue-on-limit
+```
+
+DSH 0.1.7 的 Plugins 安装界面也可以使用同一个 GitHub spec：
+
+```text
+github:Soulize/dsh-continue-on-limit-host
+```
+
+### npm 发布是可选的
+
+本仓库已经补齐 npm 元数据和 `publishConfig`。如果以后希望用户直接执行：
+
+```powershell
+dsh plugin --profile web add dsh-continue-on-limit-host
+```
+
+再登录 npm、确认包名可用并执行 `npm publish` 即可。**仅自己使用或通过 GitHub 分发时不需要 npm。**
+
+## 配置 UI（DSH 0.1.7-rc.2）
+
+打开：
+
+```text
+侧栏 -> Plugins / 插件 -> Installed / 已安装
+-> dsh-continue-on-limit-host
+-> continue-on-limit-host -> Configure / 配置
+```
+
+页面提供以下字段：
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `enabled` | `true` | 总开关 |
+| `continueText` | `继续` | 达到输出上限后发送给同一会话的提示词 |
+| `maxConsecutive` | `3` | 连续自动继续次数；`0` 表示不限次数 |
+| `minIntervalMs` | `1500` | 两次自动继续之间的最小间隔，单位 ms |
+| `includeSubagents` | `false` | 是否同时处理 `origin: subagent` 的会话 |
+
+这些值属于当前 profile 的插件 Config。UI 保存后由 Harness ConfigEditor 写回 profile patch，并通过 volatile config 热更新到正在运行的插件。
+
+Bundle 默认配置：
 
 ```yaml
-dsh-continue-on-limit:
-  enabled: true        # 总开关
-  continueText: '继续' # 发送的继续文字，可自定义，如 '请继续' / 'continue'
-  maxConsecutive: 3    # 未完成回复时的连续自动继续次数上限（防无限烧 token）
-  minIntervalMs: 1500  # 两次自动发送之间的最小间隔（毫秒）
+- insert:
+    - id: continue-on-limit-host
+      name: dsh-continue-on-limit-host
+      config:
+        enabled: true
+        continueText: '继续'
+        maxConsecutive: 3
+        minIntervalMs: 1500
+        includeSubagents: false
 ```
 
-不配置即用以上默认值。改完设置后重启 harness（或刷新页面，配置在页面加载时读取一次）。
+## 后台会话的范围
 
-## 仓库布局
+“全局”指 **当前 Host 进程中已经加载的 live Agent/Session**。例如 A、B、C 三个会话都已经在运行，你当前只打开 A，B/C 命中 `max-tokens` 也能自动继续。
 
-- `lib/index.js` — 插件 host 半区：设置命名空间 + `GET /api/dsh-continue-on-limit/config` 配置读取路由。
-- `lib/client.js` — 浏览器半区：纯策略函数（`collectNoticeCandidates` / `evaluate` / `evaluateReset`，双源检测）+ 自注册的 `continue-max-tokens` 节点定义 + 隐形观察组件（订阅会话快照、自动发送继续）。
-- `test/smoke.cjs` — `node test/smoke.cjs`：host 路由全路径（默认值/覆盖值/405）+ client 注册（自注册定义/空视图/坐席条目）与 SSR 空渲染断言 + 检测全分支（禁用/忙碌/排队/无提示/非尾部/已处理/冷却/达上限/发送）+ 双源去重 + 链重置逻辑 + 配置读取回退。
+纯历史会话如果根本没有被加载成 live Agent，本插件不会为了扫描历史而主动恢复它；没有正在发生的 `turn/end` 事件，也就没有需要续写的运行。
 
-## 已知限制
+## 安全保护
 
-- **只作用于打开中的会话**：插件订阅的是当前展示（staged）的会话，切到别的会话时只对该会话生效——这符合使用直觉：你在看哪个会话，哪个会话才会被自动继续。
-- **截断必须处于对话尾部**：如果截断之后用户已经发了新消息，插件不会去追发「继续」（此时继续的意义已经变了，用户正在主导对话）。
-- **无法区分手动「继续」**：如果用户恰好手动发送了与 `continueText` 相同的文字，插件会把它当作自己发的，不重置连续计数——最多让自动继续提前一轮停手，无其他影响。
-- **配置读取一次**：浏览器半区在页面加载时读取一次配置，改设置需刷新页面（host 端每次请求都实时解析，但浏览器端不轮询）。
-- **浏览器半区手动维护**：`lib/client.js` 为手写 bundle（与 dsh-context-compressor / dsh-auto-translate 同一技术路线），不经过构建步骤；改动后直接生效，冒烟测试兜底。
+### 不覆盖已排队工作
+
+准备发送续写前会再次检查：
+
+```text
+agent.inbox.nextTurn
+agent.inbox.nextStep
+```
+
+任意队列已有内容时，本次自动继续放弃，避免在用户刚发的新消息或其他调度工作前插入“继续”。
+
+### 连续次数上限
+
+默认最多连续自动继续 3 次。如果模型以非 `max-tokens` 原因结束，或收到新的真人 `user` 输入，计数归零。需要长输出时可以在插件 UI 把 `maxConsecutive` 调大，或设为 `0` 表示不限次数。
+
+### Subagent
+
+`includeSubagents=false` 时跳过 `session.header.origin === "subagent"`。普通后台主会话以及普通 fork 会话不受这个开关影响。
+
+## 开发 / 自检
+
+```powershell
+npm test
+```
+
+`test/smoke.cjs` 会先做 JS 语法检查；如果能找到 DSH 的 `node_modules`（可用 `DSH_HARNESS_NODE_MODULES` 指定），还会检查 Host 全局 `max-tokens` 续写策略和 Plugins 配置页注册。
+
+## 兼容性
+
+- 主要目标：DSH `0.1.7-rc.2`
+- 声明范围：`>=0.1.7-rc.1 <0.2.0`
+- Node.js：`>=20`
+
+插件使用的关键公开接口：`session/event`、`ctx.agents.get()`、`Agent.followup()`、`Agent.inbox`、volatile `Config`、`plugins.row.config`。
 
 ## License
 
