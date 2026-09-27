@@ -39,7 +39,7 @@ Host: session/event
 - 每个 Session 独立维护连续续写次数和发送间隔。
 - 正常结束、报错结束等非 `max-tokens` 轮次，或新的真人输入，会重置连续计数。
 - `maxConsecutive = 0` 可关闭次数上限。
-- Subagent 默认不自动续写，避免干扰 Harness 自己的子代理 continuation 协议；可在配置中显式开启。
+- Subagent 默认参与自动续写。Harness 官方所谓 continuation 是“可继续 child + 后续消息/冷恢复”能力，并不会在 `max-tokens` 后自动重试 child。
 - DSH 0.1.7 新版 Plugins 页面内置配置 UI，保存后通过 `.volatile()` 热更新，无需重启插件实例。
 
 ## 安装
@@ -97,8 +97,8 @@ dsh plugin --profile web add dsh-continue-on-limit-host
 | `enabled` | `true` | 总开关 |
 | `continueText` | `继续` | 达到输出上限后发送给同一会话的提示词 |
 | `maxConsecutive` | `3` | 连续自动继续次数；`0` 表示不限次数 |
-| `minIntervalMs` | `1500` | 两次自动继续之间的最小间隔，单位 ms |
-| `includeSubagents` | `false` | 是否同时处理 `origin: subagent` 的会话 |
+| `minIntervalMs` | `0` | 普通主会话的最小发送间隔；Subagent 为避免 Activation 先结算会同步入队，不等待延迟 |
+| `includeSubagents` | `true` | 是否同时处理 `origin: subagent` 的会话；默认开启 |
 
 这些值属于当前 profile 的插件 Config。UI 保存后由 Harness ConfigEditor 写回 profile patch，并通过 volatile config 热更新到正在运行的插件。
 
@@ -141,7 +141,7 @@ agent.inbox.nextStep
 
 ### Subagent
 
-`includeSubagents=false` 时跳过 `session.header.origin === "subagent"`。普通后台主会话以及普通 fork 会话不受这个开关影响。
+`includeSubagents=true` 为默认值。官方 continuable child 命中 `max-tokens` 后会自然 settlement，并给 parent 投递 `subagent-settled` 通知，但不会自己再跑一轮；因此插件会在 child 的 `turn/end(max-tokens)` 事件处理中同步 `followup()`，让下一轮在 Activation 结算前进入 inbox。若手动关闭该开关，则跳过 `session.header.origin === "subagent"`。
 
 ## 开发 / 自检
 
