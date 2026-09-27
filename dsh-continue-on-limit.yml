@@ -1,6 +1,9 @@
-# dsh-continue-on-limit profile patch (activated via dsh.bundle once installed):
-# the client rides the additive `conversation.session.header.actions` list seat,
-# so nothing in the stock composition is replaced or disabled.
 - insert:
-    - id: ui-continue-on-limit
-      name: 'dsh-continue-on-limit'
+    - id: continue-on-limit-host
+      name: 'dsh-continue-on-limit-host'
+      config:
+        enabled: true
+        continueText: '继续'
+        maxConsecutive: 3
+        minIntervalMs: 1500
+        includeSubagents: false
