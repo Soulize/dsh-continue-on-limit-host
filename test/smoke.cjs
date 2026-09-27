@@ -33,6 +33,9 @@ async function hostTests() {
   if (host.name !== 'dsh-continue-on-limit-host') throw new Error('unexpected host name: ' + host.name)
   if (!host.inject.includes('agents')) throw new Error('host must inject agents')
   if (typeof host.Config !== 'function' && typeof host.Config !== 'object') throw new Error('Config export missing')
+  if (host.DEFAULTS.includeSubagents !== true || host.DEFAULTS.minIntervalMs !== 0) {
+    throw new Error('subagent-safe defaults are wrong: ' + JSON.stringify(host.DEFAULTS))
+  }
 
   const listeners = new Map()
   const settingsCalls = []
@@ -48,7 +51,7 @@ async function hostTests() {
     continueText: '继续',
     maxConsecutive: 3,
     minIntervalMs: 0,
-    includeSubagents: false,
+    includeSubagents: true,
   }
   const cleanup = []
   const ctx = {
@@ -109,13 +112,19 @@ async function hostTests() {
   agent.inbox.nextTurn.length = 0
 
   session.header.origin = 'subagent'
+  config.includeSubagents = false
   max()
   await delay(5)
-  if (sent.length !== 4) throw new Error('subagent should be skipped by default')
+  if (sent.length !== 4) throw new Error('includeSubagents=false should skip the child')
+
+  // A continuable child can naturally settle as soon as it becomes idle with
+  // an empty inbox. Even with a large root-session delay configured, the
+  // subagent continuation must therefore be queued synchronously in turn/end.
   config.includeSubagents = true
+  config.minIntervalMs = 5000
   max()
-  await delay(5)
-  if (sent.length !== 5) throw new Error('includeSubagents=true should allow the child')
+  if (sent.length !== 5) throw new Error('subagent continuation must enqueue synchronously before Activation settlement')
+  config.minIntervalMs = 0
   session.header.origin = undefined
 
   emitSession({ type: 'user/message', seq: seq++, data: { source: { kind: 'user' } } })
