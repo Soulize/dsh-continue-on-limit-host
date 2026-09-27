@@ -5,5 +5,5 @@
         enabled: true
         continueText: '继续'
         maxConsecutive: 3
-        minIntervalMs: 1500
-        includeSubagents: false
+        minIntervalMs: 0
+        includeSubagents: true
