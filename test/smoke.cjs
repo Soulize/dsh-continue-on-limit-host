@@ -113,6 +113,10 @@ async function hostTests() {
     const payload = { agent, turn, signal: new AbortController().signal }
     for (const cb of listeners.get('agent/turn-stopping') ?? []) await cb(payload)
   }
+  const emitToolResult = async (name, result = {}) => {
+    const exec = { name, agent, parent: undefined }
+    for (const cb of listeners.get('tools/result') ?? []) await cb(exec, { isError: false, ...result })
+  }
   const finishStream = (kind) => [{ type: 'chunk', time: Date.now(), chunk: { type: 'finish', reason: { kind } } }]
   const assistant = (turn, step, kind) => session.append('assistant/message', {
     turn,
@@ -174,6 +178,40 @@ async function hostTests() {
   const firstFinish = firstSteerAssistant?.data.stream?.find(record => record.type === 'chunk' && record.chunk?.type === 'finish')
   if (firstFinish?.chunk?.reason?.kind !== 'max-tokens') throw new Error('steer mode must preserve provider-level max-tokens history')
 
+  // STEER TOOL LOOP: an ordinary tool-calls recovery step must not close
+  // merely because the earlier max-tokens outcome is sticky. The plugin adds
+  // one same-turn bridge steer, then a later clean stop closes normally.
+  turn += 1
+  session.append('turn/start', { turn })
+  assistant(turn, 1, 'max-tokens')
+  await emitStopping(turn)
+  inbox.nextStep.length = 0
+  assistant(turn, 2, 'tool-calls')
+  await emitStopping(turn)
+  if (steers.length !== 3) throw new Error('steer recovery tool-call step did not queue the tool-loop bridge')
+  if (!logs.some(line => line.includes('STEER_TOOL_LOOP_BRIDGE_QUEUED'))) throw new Error('steer tool-loop bridge diagnostic marker missing')
+  inbox.nextStep.length = 0
+  assistant(turn, 3, 'stop')
+  await emitStopping(turn)
+  const toolLoopEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
+  if (toolLoopEnd.data.reason.kind !== 'completed') throw new Error('steer tool-loop recovery did not complete cleanly')
+
+  // A tool result that explicitly concludes the turn is terminal and must not
+  // receive the bridge steer. It is also a clean recovery terminal for the
+  // aggregate sticky max-tokens rewrite.
+  turn += 1
+  session.append('turn/start', { turn })
+  assistant(turn, 1, 'max-tokens')
+  await emitStopping(turn)
+  inbox.nextStep.length = 0
+  assistant(turn, 2, 'tool-calls')
+  await emitToolResult('finalize', { concludesTurn: true })
+  await emitStopping(turn)
+  if (steers.length !== 4) throw new Error('concluding tool must not receive a tool-loop bridge steer')
+  if (!logs.some(line => line.includes('STEER_CONCLUDING_TOOL_CAPTURED'))) throw new Error('concluding tool diagnostic marker missing')
+  const concludingToolEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
+  if (concludingToolEnd.data.reason.kind !== 'completed') throw new Error('concluding tool recovery did not normalize sticky max-tokens')
+
   // Repeated max-tokens in steer mode adds one steer per capped step, still no followup.
   turn += 1
   session.append('turn/start', { turn })
@@ -182,7 +220,7 @@ async function hostTests() {
   inbox.nextStep.length = 0
   assistant(turn, 2, 'max-tokens')
   await emitStopping(turn)
-  if (steers.length !== 3) throw new Error('steer mode must continue once per max-tokens step')
+  if (steers.length !== 6) throw new Error('steer mode must continue once per max-tokens step')
   if (followups.length !== 1) throw new Error('steer mode leaked into followup path')
   inbox.nextStep.length = 0
   assistant(turn, 3, 'stop')
@@ -197,7 +235,7 @@ async function hostTests() {
   assistant(turn, 1, 'max-tokens')
   await emitStopping(turn)
   if (followups.length !== 2) throw new Error('mode switch back to followup did not select followup path')
-  if (steers.length !== 3) throw new Error('mode switch back to followup leaked a steer')
+  if (steers.length !== 6) throw new Error('mode switch back to followup leaked a steer')
   session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
   inbox.nextTurn.length = 0
 
