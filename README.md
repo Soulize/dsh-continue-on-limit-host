@@ -45,24 +45,27 @@ max-tokens 仅作为插件内部触发信号
 AgentLoop 从未进入 sticky max-tokens 状态
 ```
 
-如果截断前已经形成完整 `tool-call` block，则插件不额外发送“继续”，而是把终止原因映射成 `tool-calls`，让 DSH 原生工具循环继续：
+即使截断响应里已经出现 `tool-call` 的 `block-end`，插件也**不会执行它**。DSH 自己的 `BlockAssembler` 在 `finish=max-tokens` 时会丢弃该响应中的全部 tool-call，因为 block 已关闭并不等于这个受截断响应里的工具调用可以安全执行。Steer 0.4.1 保留同一安全语义：
 
 ```text
 Provider finish=max-tokens
-+ complete tool-call
++ zero or more tool-call blocks
         ↓
-插件对外输出 finish=tool-calls
+插件丢弃该响应中的全部 tool-call chunks
         ↓
-执行工具
+保留 text / reasoning
         ↓
-tool result -> 原生 next-step
+agent.steer("继续")
         ↓
-继续 AgentLoop
+对 AgentLoop 输出 finish=stop
 ```
+
+正常的、非 max-tokens 的 `finish=tool-calls` 完全不改，仍交给 DSH 原生工具循环。
 
 因此 Steer 模式下：
 
 - AgentLoop 不会看到 `FinishReason { kind: "max-tokens" }`
+- max-tokens 响应中的 tool-call 不会绕过 DSH 原本的截断安全策略
 - 持久化 `assistant/message.stream` 中不会记录 `max-tokens`
 - 不会触发 DSH 的 sticky `turnEnds=max-tokens`
 - 不需要修改 `Session.append()`
@@ -70,7 +73,9 @@ tool result -> 原生 next-step
 - 不需要 tool-loop bridge
 - 正常结束由 DSH 原生写成 `turn/end(completed)`
 
-对 shipped pi-ai adapter，插件还会把 replay metadata 中的原生 `stopReason: "length"` 同步改为 `stop` 或 `toolUse`；DeepSeek Messages 的 replay metadata 本身不保存 stop reason。
+为避免已经流出的 tool-call 无法撤回，Steer 会从当前响应第一个 tool-call chunk 开始暂存后续 stream：若最终不是 max-tokens，则原样释放；若最终是 max-tokens，则过滤全部 tool-call 后再释放其余内容。
+
+对 shipped pi-ai adapter，插件还会把 replay metadata 中的原生 `stopReason: "length"` 同步改为 `stop`，并按相同 block 顺序删除 tool-call replay entries；DeepSeek Messages 的 replay metadata 本身不保存 stop reason。
 
 ## 配置
 
@@ -96,7 +101,7 @@ debugLogging: false
 | `includeSubagents` | `true` | 是否处理 Subagent |
 | `debugLogging` | `false` | 详细日志 |
 
-Steer 模式中，`maxConsecutive` 限制的是插件主动注入的 `agent.steer()` 次数。若截断响应已经包含完整工具调用，后续由 DSH 原生工具循环驱动，不额外消耗一次 Steer 计数。
+Steer 模式中，`maxConsecutive` 限制的是插件主动注入的 `agent.steer()` 次数。每次被截获的 max-tokens 响应都会丢弃其中的 tool-call；若允许继续且 inbox 没有既有工作，则注入一次 Steer。
 
 配置为 volatile，可在 Plugins 页面热更新；模式切换会清空上一模式的连续计数和已处理状态。
 
@@ -207,7 +212,8 @@ Smoke test 覆盖：
 
 - Follow-up 保留 max-tokens
 - Steer 将 max-tokens 映射为 stop
-- 完整工具调用映射为 tool-calls
+- max-tokens 响应中的 tool-call 全部丢弃
+- 正常非截断 tool-calls 原样通过
 - pi-ai replay `length` 同步隐藏
 - Steer 次数上限下仍不向 AgentLoop 暴露 max-tokens
 - Follow-up / Steer 热切换隔离
