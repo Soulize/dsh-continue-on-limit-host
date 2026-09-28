@@ -2,111 +2,106 @@
 
 面向 **DeepSeek Harness / DSH 0.1.7-rc.2** 的 Host 侧全局自动续写插件。
 
-当模型因为单次输出上限结束，Harness 最终会写入：
+模型命中单次输出上限时，Harness 会把 provider 的 `length` / `max_tokens` 归一化为：
 
 ```text
-provider finish_reason = length
-  -> llm-pi-ai stopReason = length
-  -> FinishReason { kind: "max-tokens" }
-  -> turn/end.reason.kind = "max-tokens"
+FinishReason { kind: "max-tokens" }
 ```
 
-本插件直接在 Host 监听最后这个 `turn/end` 事件，并向同一个 live Agent 排队一条 `followup("继续")`。因此它不再依赖当前浏览器正在展示的 staged session：**后台已加载的主会话即使没有打开在页面上，也可以继续运行。**
+插件在 Host 的 `agent/turn-stopping` 终止检查点读取当前 Turn 最新的 Assistant stream，并在最新 provider finish 为 `max-tokens` 时自动续写。它不依赖当前浏览器正在显示哪个会话，因此后台 live 主会话和 live Subagent 都能工作。
 
-## 与原版的主要区别
+## 两种续写实现
 
-原版 `dsh-continue-on-limit` 把观察器挂在 Web Client 的 `conversation.session.header.actions`，通过当前页面的 `useSession()` 检测 `turn-max-tokens`，所以只能作用于当前打开的会话。
+0.3.0 起提供两个**严格互斥**的实现，通过 `continuationMode` 二选一。默认保持原有 Follow-up 路径。
 
-这个 fork 改为：
+### Follow-up：新 Turn（默认）
 
 ```text
-Host: session/event
-       |
-       +-- turn/end.reason.kind === "max-tokens"
-               |
-               +-- ctx.agents.get(session.id)
-                       |
-                       +-- agent.followup("继续")
+Step N -> max-tokens
+        ↓
+agent/turn-stopping
+        ↓
+agent.followup("继续")
+        ↓
+nextTurn = 1
+        ↓
+turn/end(max-tokens)
+        ↓
+同一个 driver 直接进入下一 Turn
 ```
 
-检测依据仍然是 Harness 自己的 `max-tokens` 链路，不统计 token，也不解析页面上的中文提示。
+特点：
 
-## 功能
+- 使用 DSH 官方 `Agent.followup()`。
+- “继续”进入 `next-turn`，恢复发生在新的 Turn。
+- 当前 Turn 真实保留 `turn/end(max-tokens)`。
+- 下一 Turn 正常结束后可得到独立的 `turn/end(completed)`。
+- 不修改任何 Session 事件，是默认、保守实现。
+- Follow-up 在 `turn/end` **之前**排队，因此 continuable Subagent 不会在两个 Turn 之间先进入 idle settlement。
 
-- Host 全局检测 `turn/end.reason.kind === "max-tokens"`。
-- 支持后台 live 主会话，不要求该会话正在 Web UI 中打开。
-- 如果 turn 结束后已有用户或其他插件工作排队，不抢在它们前面发送“继续”。
-- 每个 Session 独立维护连续续写次数和发送间隔。
-- 正常结束、报错结束等非 `max-tokens` 轮次，或新的真人输入，会重置连续计数。
-- `maxConsecutive = 0` 可关闭次数上限。
-- Subagent 默认参与自动续写。Harness 官方所谓 continuation 是“可继续 child + 后续消息/冷恢复”能力，并不会在 `max-tokens` 后自动重试 child。
-- DSH 0.1.7 新版 Plugins 页面内置配置 UI，保存后通过 `.volatile()` 热更新，无需重启插件实例。
-
-## 安装
-
-### 直接从 GitHub 安装（不需要发布 npm）
-
-DSH 官方插件管理器支持 Git 仓库作为安装源，npm 发布不是必需条件：
-
-```powershell
-dsh plugin --profile web add github:Soulize/dsh-continue-on-limit-host
-```
-
-安装或更新 Bundle 后重启对应 profile：
-
-```powershell
-dsh web --profile web
-```
-
-如果之前安装了原版 `dsh-continue-on-limit`，建议先移除，避免两个自动续写插件同时工作：
-
-```powershell
-dsh plugin --profile web remove dsh-continue-on-limit
-```
-
-DSH 0.1.7 的 Plugins 安装界面也可以使用同一个 GitHub spec：
+### Steer：同 Turn 插话（实验）
 
 ```text
-github:Soulize/dsh-continue-on-limit-host
+Step 1 -> max-tokens
+        ↓
+agent/turn-stopping
+        ↓
+agent.steer("继续")
+        ↓
+nextStep = 1
+        ↓
+Step 2
 ```
 
-### GitHub 安装源的更新限制（DSH 0.1.7-rc.2）
+如果 Step 2 又是 `max-tokens`，插件会再次 Steer；如果最终最新 provider finish 为正常 `stop`，插件允许 Turn 结束。
 
-DSH 0.1.7-rc.2 的 Plugin Manager 在 `installBundle()` 完成后，会比较 profile `package.json` 的 `dependencies` 前后值来推断“本次安装/更新的是哪个包”。如果一个已经安装的 GitHub spec 再次使用完全相同的地址，例如：
+DSH 0.1.7-rc.2 的 AgentLoop 有意把 Turn 级 `max-tokens` 设为 sticky：同一 Turn 中任何 Step 命中过一次 `max-tokens`，后续正常 Step 也不会自动把最终 `turn/end` 降级回 `completed`。
+
+因此 Steer 模式在插件内部额外做一个**仅当前 Session、仅当前恢复 Turn、一次性**的 `session.append` 包装：
 
 ```text
-github:Soulize/dsh-continue-on-limit-host
+provider-level history:
+Step 1 finish=max-tokens   <- 永久保留
+Step 2 finish=max-tokens   <- 永久保留
+Step 3 finish=stop         <- 永久保留
+
+turn-level outcome:
+原生将写 turn/end(max-tokens)
+        ↓
+插件确认：
+- 当前模式仍是 steer
+- 当前 Turn 是插件自己启动的恢复链
+- 最新 provider finish 是 stop
+        ↓
+仅把这一个 turn/end 写为 completed
 ```
 
-pnpm 可以更新 lockfile / node_modules，但 `package.json` 中该 dependency 的 spec 可能保持不变。此时 DSH 看不到唯一的 dependency 变化，会报：
+这条路径：
+
+- 不修改 DSH core 包。
+- 不改全局 `Session.prototype`。
+- 不篡改任何 Assistant stream 中真实的 provider `max-tokens`。
+- 只在插件自己发起的 Steer 恢复链最终正常 stop 时，把 sticky 的 Turn 级结果从 `max-tokens` 归一化成 `completed`。
+- 如果恢复再次截断、达到续写上限、发生错误/取消、用户/其他插件抢占，Turn 仍保留原生结果。
+- 对 Subagent 来说，整个恢复过程留在同一个 Turn/driver 内，不会在中间进入 idle settlement。
+
+## 两种实现不会重复执行
+
+运行时只有一个分支：
 
 ```text
-无法从依赖变更中确定安装了哪一个包
+agent/turn-stopping
+      |
+      +-- continuationMode=followup -> followup implementation -> return
+      |
+      +-- continuationMode=steer    -> steer implementation    -> return
 ```
 
-这是 DSH 0.1.7-rc.2 对重复 Git spec 的识别限制，不是插件 bundle metadata 缺失。
+模式热切换会先清空上一实现的计数和临时状态，并撤销尚未使用的一次性 Steer append 包装。不会同时发送 `followup()` 和 `steer()`。
 
-使用 GitHub 分发时，更新建议显式改变 ref，例如：
+## 配置
 
-```powershell
-dsh plugin --profile web add github:Soulize/dsh-continue-on-limit-host#<new-commit-sha>
-```
-
-或者先卸载后安装新的 GitHub ref。若需要 Plugin Manager 中更自然的按包名更新流程，建议发布到 npm，并使用包名 / `name@version` 安装，因为 DSH 对 registry spec 有按 package name 的回退识别。
-
-### npm 发布是可选的
-
-本仓库已经补齐 npm 元数据和 `publishConfig`。如果以后希望用户直接执行：
-
-```powershell
-dsh plugin --profile web add dsh-continue-on-limit-host
-```
-
-再登录 npm、确认包名可用并执行 `npm publish` 即可。**仅自己使用或通过 GitHub 分发时不需要 npm。**
-
-## 配置 UI（DSH 0.1.7-rc.2）
-
-打开：
+DSH 0.1.7 Plugins 页面：
 
 ```text
 侧栏 -> Plugins / 插件 -> Installed / 已安装
@@ -114,20 +109,17 @@ dsh plugin --profile web add dsh-continue-on-limit-host
 -> continue-on-limit-host -> Configure / 配置
 ```
 
-页面提供以下字段：
-
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
 | `enabled` | `true` | 总开关 |
-| `continueText` | `继续` | 达到输出上限后发送给同一会话的提示词 |
-| `maxConsecutive` | `3` | 连续自动继续次数；`0` 表示不限次数 |
-| `minIntervalMs` | `0` | 普通主会话的最小发送间隔；Subagent 为避免 Activation 先结算会同步入队，不等待延迟 |
-| `includeSubagents` | `true` | 是否同时处理 `origin: subagent` 的会话；默认开启 |
-| `debugLogging` | `false` | 输出 Host 诊断日志，用于确认是否捕获 `max-tokens` 以及为何没有续写 |
+| `continuationMode` | `followup` | `followup` 或 `steer`，严格二选一 |
+| `continueText` | `继续` | 自动发送的续写提示词 |
+| `maxConsecutive` | `3` | 连续自动续写次数；`0` 表示不限 |
+| `minIntervalMs` | `0` | 在 `agent/turn-stopping` 内等待的最小发送间隔 |
+| `includeSubagents` | `true` | 是否同时处理 Subagent |
+| `debugLogging` | `false` | 开启详细诊断日志 |
 
-这些值属于当前 profile 的插件 Config。UI 保存后由 Harness ConfigEditor 写回 profile patch，并通过 volatile config 热更新到正在运行的插件。
-
-Bundle 默认配置：
+Bundle 默认：
 
 ```yaml
 - insert:
@@ -135,38 +127,160 @@ Bundle 默认配置：
       name: dsh-continue-on-limit-host
       config:
         enabled: true
+        continuationMode: 'followup'
         continueText: '继续'
         maxConsecutive: 3
-        minIntervalMs: 1500
-        includeSubagents: false
+        minIntervalMs: 0
+        includeSubagents: true
+        debugLogging: false
 ```
 
-## 后台会话的范围
+## 检测规则
 
-“全局”指 **当前 Host 进程中已经加载的 live Agent/Session**。例如 A、B、C 三个会话都已经在运行，你当前只打开 A，B/C 命中 `max-tokens` 也能自动继续。
+插件不统计 token，也不解析 UI 文案。它读取当前 Turn 最新的 `assistant/message` / `assistant/attempt` 内嵌 stream，并检查最后一个 `finish`：
 
-纯历史会话如果根本没有被加载成 live Agent，本插件不会为了扫描历史而主动恢复它；没有正在发生的 `turn/end` 事件，也就没有需要续写的运行。
+```text
+latest Assistant settlement
+        ↓
+lastAssistantStreamChunk(stream, "finish")
+        ↓
+finish.reason.kind === "max-tokens"
+```
+
+只看**最新 Step**，不会因为同一 Turn 中更早的旧 `max-tokens` 而重复发送。
 
 ## 安全保护
 
-### 不覆盖已排队工作
+### 已有工作时不抢队列
 
-准备发送续写前会再次检查：
+发送前检查：
 
 ```text
 agent.inbox.nextTurn
 agent.inbox.nextStep
 ```
 
-任意队列已有内容时，本次自动继续放弃，避免在用户刚发的新消息或其他调度工作前插入“继续”。
+任意一个已有内容时，本次自动续写跳过。
 
 ### 连续次数上限
 
-默认最多连续自动继续 3 次。如果模型以非 `max-tokens` 原因结束，或收到新的真人 `user` 输入，计数归零。需要长输出时可以在插件 UI 把 `maxConsecutive` 调大，或设为 `0` 表示不限次数。
+默认最多连续 3 次；`0` 表示不限。真人新消息或正常完成会重置计数。
 
-### Subagent
+### 模式隔离
 
-`includeSubagents=true` 为默认值。官方 continuable child 命中 `max-tokens` 后不会自己再跑一轮。插件不会等到 `turn/end` 才发送，而是在 `agent/turn-stopping` 终止检查点读取当前 turn 已持久化的 Assistant stream，确认存在 `finish.reason.kind === "max-tokens"` 后立即 `followup()` 到 `next-turn`。这个时机不处在 `Session.append()` 发布栈内，因此不会重入；同时消息在 `turn/end` 之前已经进入 inbox，所以 AgentLoop 在写完 `turn/end` 后会看到 pending work 并保持同一个 driver 连续进入下一 turn。Subagent 因而不会在两段之间先进入 idle settlement。若手动关闭该开关，则跳过 `session.header.origin === "subagent"`。
+每个 Session 的运行状态绑定当前 `continuationMode`。热切换模式会：
+
+- 归零连续计数；
+- 清除上一模式的已处理标记；
+- 清除 Steer 恢复 Turn；
+- 恢复可能存在的 Session append 临时包装。
+
+### Steer 的 Turn-end 改写边界
+
+Steer 模式只在以下条件全部成立时把最终 Turn 结果归一化为 `completed`：
+
+1. 插件当前仍启用；
+2. 当前仍选择 `steer`；
+3. 这个 Turn 确实由本插件在 `max-tokens` 后发起过 Steer 恢复；
+4. DSH 原本将写 `turn/end(max-tokens)`；
+5. 当前 Turn 最新 provider finish 是正常 `stop`。
+
+Step 级 `max-tokens` 永远不会被清除，因此 replay、usage、截断工具调用处理仍保留真实 provider 事实。
+
+## 为什么不在 turn/end 后发送
+
+`session/event` 在 `Session.append('turn/end', ...)` 的同步发布栈内触发，而 `followup()` / `steer()` 都会通过 Inbox 再触发新的 Session append。直接在 listener 内发送会报：
+
+```text
+Error: session append cannot reenter while another append is being published
+```
+
+在 `turn/end` 后再用 microtask 发送也可能错过当前 driver 的 `inbox.hasPending` 判断。
+
+所以两个实现都在官方的 `agent/turn-stopping` checkpoint 工作。
+
+## Subagent
+
+`includeSubagents=true` 默认开启。
+
+官方 continuable Subagent 的“continuation”是后续消息/冷恢复能力，不代表 child 命中 `max-tokens` 后会自动再请求一次模型。
+
+- Follow-up 模式：在 child 的 `turn/end` 之前先把 next-turn 排好，使同一 driver 连续进入下一 Turn。
+- Steer 模式：直接把“继续”放入 next-step，使当前 Turn 不结束；最终正常 stop 后再由插件归一化 sticky Turn 结果。
+
+两条路径都避免“先 idle settlement，再给 Lead 发送 max-tokens 终止通知，然后才续写”的竞态。
+
+## 诊断日志
+
+插件成功加载时无条件写一条 `ACTIVATED`：
+
+```text
+$DSH_HOME/logs/dsh-continue-on-limit-host.log
+```
+
+Windows 默认通常是：
+
+```text
+%USERPROFILE%\.dsh\logs\dsh-continue-on-limit-host.log
+```
+
+PowerShell 实时查看：
+
+```powershell
+Get-Content "$env:USERPROFILE\.dsh\logs\dsh-continue-on-limit-host.log" -Wait
+```
+
+打开 `debugLogging` 后，Follow-up 正常链路重点看：
+
+```text
+MAX_TOKENS_PRESTOP_CAPTURED ... mode=followup
+FOLLOWUP_MAX_TOKENS_CAPTURED ...
+FOLLOWUP_QUEUED ...
+TURN_END_CAPTURED ... reason=max-tokens
+```
+
+Steer 正常链路重点看：
+
+```text
+MAX_TOKENS_PRESTOP_CAPTURED ... mode=steer
+STEER_TURN_END_REWRITE_ARMED
+STEER_MAX_TOKENS_CAPTURED ...
+STEER_QUEUED ...
+...
+STEER_RECOVERY_REACHED_CLEAN_STOP ...
+STEER_TURN_END_REWRITTEN max-tokens->completed
+TURN_END_CAPTURED ... mode=steer ... reason=completed
+```
+
+若达到次数上限或 inbox 已有别的工作，会出现 `AUTO_CONTINUE_SKIPPED`。
+
+## 安装
+
+GitHub 安装：
+
+```powershell
+dsh plugin --profile web add github:Soulize/dsh-continue-on-limit-host
+```
+
+DSH 0.1.7-rc.2 对重复的无 ref Git spec 存在更新识别限制。更新时建议指定新 commit：
+
+```powershell
+dsh plugin --profile web add github:Soulize/dsh-continue-on-limit-host#<new-commit-sha>
+```
+
+如果 Plugin Manager 报：
+
+```text
+无法从依赖变更中确定安装了哪个包
+```
+
+可先移除再安装带 SHA 的版本。
+
+npm 发布不是必需条件；本仓库保留了 npm 元数据，后续若发布 registry 包即可改用包名安装。
+
+## 后台会话范围
+
+“全局”指当前 Host 进程中已经加载的 live Agent/Session。纯历史、未加载的 Session 不会被本插件主动扫描或恢复。
 
 ## 开发 / 自检
 
@@ -174,7 +288,7 @@ agent.inbox.nextStep
 npm test
 ```
 
-`test/smoke.cjs` 会先做 JS 语法检查；如果能找到 DSH 的 `node_modules`（可用 `DSH_HARNESS_NODE_MODULES` 指定），还会检查 Host 全局 `max-tokens` 续写策略和 Plugins 配置页注册。
+`test/smoke.cjs` 会做语法检查；若可找到 DSH runtime modules，还会分别验证 Follow-up 与 Steer 两条路径、模式隔离和 Plugins 配置页注册。
 
 ## 兼容性
 
@@ -182,93 +296,17 @@ npm test
 - 声明范围：`>=0.1.7-rc.1 <0.2.0`
 - Node.js：`>=20`
 
-插件使用的关键公开接口：`session/event`、`ctx.agents.get()`、`Agent.followup()`、`Agent.inbox`、volatile `Config`、`plugins.row.config`。
+关键接口：
+
+- `agent/turn-stopping`
+- `Agent.followup()`
+- `Agent.steer()`
+- `Agent.inbox`
+- `Session.append()`
+- `session/event`
+- volatile Config
+- `plugins.row.config`
 
 ## License
 
 MIT
-
-
-## 诊断日志
-
-插件每次成功加载都会无条件追加一条 `ACTIVATED` 到：
-
-```text
-$DSH_HOME/logs/dsh-continue-on-limit-host.log
-```
-
-默认 `$DSH_HOME` 是 `~/.dsh`，Windows 通常就是 `%USERPROFILE%\\.dsh`。因此默认日志文件为：
-
-```text
-%USERPROFILE%\\.dsh\\logs\\dsh-continue-on-limit-host.log
-```
-
-在插件管理页打开 `启用诊断日志` 后，详细事件也写入这个文件，并同时尝试通过 Host logger 输出到控制台。Host Web profile 不保证挂载 console exporter，因此排查时以该文件为准。统一前缀为：
-
-```text
-[dsh-continue-on-limit-host][debug]
-```
-
-重点看以下事件：
-
-```text
-TURN_END_CAPTURED
-MAX_TOKENS_CAPTURED
-AUTO_CONTINUE_QUEUED
-AUTO_CONTINUE_SKIPPED
-AUTO_CONTINUE_FAILED
-SUBAGENT_END
-SESSION_DISPOSED
-```
-
-理想的 Subagent 截断续写链路应该出现：
-
-```text
-MAX_TOKENS_PRESTOP_CAPTURED ... origin=subagent
-... calling agent.followup at turn-stopping ...
-AUTO_CONTINUE_QUEUED_PRE_TURN_END ...
-TURN_END_CAPTURED ... reason=max-tokens ...
-MAX_TOKENS_CONFIRMED ... prestopHandled=true
-```
-
-如果只看到：
-
-```text
-SUBAGENT_END ... stopReason=max-tokens
-```
-
-却没有 `MAX_TOKENS_CAPTURED`，说明 lifecycle 看到了 token 上限，但 `session/event` 监听没有收到该 child 的 `turn/end`。
-
-如果看到了 `MAX_TOKENS_CAPTURED`，随后出现：
-
-```text
-skip: liveAgent=no
-```
-
-说明事件抓到了，但 child Agent 在续写前已经不在 registry 中。
-
-如果出现：
-
-```text
-AUTO_CONTINUE_QUEUED
-```
-
-但 UI 仍未出现下一轮模型请求，则应继续检查 Agent inbox claim / driver wakeup 路径。
-
-
-### 为什么改到 `agent/turn-stopping`
-
-DSH 的 `session/event` 是同步发布的，而 `agent.followup()` 会通过 Inbox 再追加 `agent/inbox/spliced`。因此在 `turn/end` listener 调用栈里直接执行会触发：
-
-```text
-Error: session append cannot reenter while another append is being published
-```
-
-仅仅在 `turn/end` 后 `queueMicrotask(followup)` 也不够稳妥：此时 `turn()` 已经基于旧的空 Inbox 决定返回 `false`，microtask 虽能插入消息，却可能错过当前 driver 的“是否继续下一 turn”判断。
-
-从 0.2.5 起，插件改为在官方 `agent/turn-stopping` checkpoint 做两步：
-
-1. 从当前 turn 的 `assistant/message` / `assistant/attempt` 内嵌 stream 读取最后的 `finish`，若任一步为 `max-tokens` 就标记该 turn。
-2. 在 `turn/end` 写入之前调用 `agent.followup()`。
-
-这样 `turn/end` 仍会保持 `reason=max-tokens`，但写完后 `inbox.hasPending === true`，AgentLoop 会在同一 driver 中直接进入下一 turn。对于 continuable Subagent，这也阻止了中间的 idle settlement，因此 Lead 不会先收到“child 已因 max-tokens 结束”的 settlement 通知。
