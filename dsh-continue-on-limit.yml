@@ -3,6 +3,7 @@
       name: 'dsh-continue-on-limit-host'
       config:
         enabled: true
+        continuationMode: 'followup'
         continueText: '继续'
         maxConsecutive: 3
         minIntervalMs: 0
