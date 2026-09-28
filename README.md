@@ -166,7 +166,7 @@ agent.inbox.nextStep
 
 ### Subagent
 
-`includeSubagents=true` 为默认值。官方 continuable child 命中 `max-tokens` 后不会自己再跑一轮。由于 `session/event` 是同步发布且 `Session.append()` 禁止重入，插件不能在 `turn/end` listener 内直接调用 `followup()`；它会在该事件发布完成后的下一个 microtask 调用 `followup()`。这也是 Harness 自身测试采用的 session-listener send 模式，并且会早于 child 进入后续 idle settlement 检查。若手动关闭该开关，则跳过 `session.header.origin === "subagent"`。
+`includeSubagents=true` 为默认值。官方 continuable child 命中 `max-tokens` 后不会自己再跑一轮。插件不会等到 `turn/end` 才发送，而是在 `agent/turn-stopping` 终止检查点读取当前 turn 已持久化的 Assistant stream，确认存在 `finish.reason.kind === "max-tokens"` 后立即 `followup()` 到 `next-turn`。这个时机不处在 `Session.append()` 发布栈内，因此不会重入；同时消息在 `turn/end` 之前已经进入 inbox，所以 AgentLoop 在写完 `turn/end` 后会看到 pending work 并保持同一个 driver 连续进入下一 turn。Subagent 因而不会在两段之间先进入 idle settlement。若手动关闭该开关，则跳过 `session.header.origin === "subagent"`。
 
 ## 开发 / 自检
 
@@ -224,11 +224,11 @@ SESSION_DISPOSED
 理想的 Subagent 截断续写链路应该出现：
 
 ```text
-TURN_END_CAPTURED ... reason=max-tokens ... origin=subagent
-MAX_TOKENS_CAPTURED ...
-... subagent path: queueMicrotask followup
-... calling agent.followup ...
-AUTO_CONTINUE_QUEUED ...
+MAX_TOKENS_PRESTOP_CAPTURED ... origin=subagent
+... calling agent.followup at turn-stopping ...
+AUTO_CONTINUE_QUEUED_PRE_TURN_END ...
+TURN_END_CAPTURED ... reason=max-tokens ...
+MAX_TOKENS_CONFIRMED ... prestopHandled=true
 ```
 
 如果只看到：
@@ -256,12 +256,19 @@ AUTO_CONTINUE_QUEUED
 但 UI 仍未出现下一轮模型请求，则应继续检查 Agent inbox claim / driver wakeup 路径。
 
 
-### 为什么不是在 `turn/end` listener 里直接 `followup()`
+### 为什么改到 `agent/turn-stopping`
 
-DSH 的 `session/event` 是同步发布的，而 `agent.followup()` 会向同一个 Session 追加 `user/message`。因此如果在 `turn/end` 的 listener 调用栈里直接执行，会触发：
+DSH 的 `session/event` 是同步发布的，而 `agent.followup()` 会通过 Inbox 再追加 `agent/inbox/spliced`。因此在 `turn/end` listener 调用栈里直接执行会触发：
 
 ```text
 Error: session append cannot reenter while another append is being published
 ```
 
-本插件从 0.2.4 起改为 `queueMicrotask(() => agent.followup(...))`。这样先让当前 `turn/end` append 完成，再在同一事件循环 tick 的微任务阶段排队下一 turn。
+仅仅在 `turn/end` 后 `queueMicrotask(followup)` 也不够稳妥：此时 `turn()` 已经基于旧的空 Inbox 决定返回 `false`，microtask 虽能插入消息，却可能错过当前 driver 的“是否继续下一 turn”判断。
+
+从 0.2.5 起，插件改为在官方 `agent/turn-stopping` checkpoint 做两步：
+
+1. 从当前 turn 的 `assistant/message` / `assistant/attempt` 内嵌 stream 读取最后的 `finish`，若任一步为 `max-tokens` 就标记该 turn。
+2. 在 `turn/end` 写入之前调用 `agent.followup()`。
+
+这样 `turn/end` 仍会保持 `reason=max-tokens`，但写完后 `inbox.hasPending === true`，AgentLoop 会在同一 driver 中直接进入下一 turn。对于 continuable Subagent，这也阻止了中间的 idle settlement，因此 Lead 不会先收到“child 已因 max-tokens 结束”的 settlement 通知。
