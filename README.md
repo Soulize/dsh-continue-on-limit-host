@@ -191,7 +191,19 @@ MIT
 
 ## 诊断日志
 
-在插件管理页打开 `启用诊断日志` 后，Host 会用统一前缀输出：
+插件每次成功加载都会无条件追加一条 `ACTIVATED` 到：
+
+```text
+$DSH_HOME/logs/dsh-continue-on-limit-host.log
+```
+
+默认 `$DSH_HOME` 是 `~/.dsh`，Windows 通常就是 `%USERPROFILE%\\.dsh`。因此默认日志文件为：
+
+```text
+%USERPROFILE%\\.dsh\\logs\\dsh-continue-on-limit-host.log
+```
+
+在插件管理页打开 `启用诊断日志` 后，详细事件也写入这个文件，并同时尝试通过 Host logger 输出到控制台。Host Web profile 不保证挂载 console exporter，因此排查时以该文件为准。统一前缀为：
 
 ```text
 [dsh-continue-on-limit-host][debug]
