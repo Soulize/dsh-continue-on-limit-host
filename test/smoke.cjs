@@ -34,6 +34,7 @@ async function hostTests() {
   if (host.name !== 'dsh-continue-on-limit-host') throw new Error('unexpected host name: ' + host.name)
   if (!host.inject.includes('agents') || !host.inject.includes('profileContext')) throw new Error('host injects are incomplete')
   if (host.DEFAULTS.continuationMode !== 'followup') throw new Error('followup must remain the default mode')
+  if (host.DEFAULTS.steerToolCallPolicy !== 'discard') throw new Error('safe discard must remain the default steer tool policy')
 
   const listeners = new Map()
   const settingsCalls = []
@@ -73,6 +74,7 @@ async function hostTests() {
   const config = {
     enabled: true,
     continuationMode: 'followup',
+    steerToolCallPolicy: 'discard',
     continueText: '继续',
     maxConsecutive: 3,
     minIntervalMs: 0,
@@ -246,6 +248,39 @@ async function hostTests() {
   }
   if (steers.length !== 2) throw new Error('normal tool-calls response must not steer')
   session.append('turn/end', { turn, reason: { kind: 'completed' } })
+
+  // v0.4.0 compatibility: do not buffer/drop capped tool chunks. If at least
+  // one tool call reached block-end, expose tool-calls and let Harness execute
+  // the streamed call instead of injecting another steer.
+  config.steerToolCallPolicy = 'passthrough'
+  turn += 1
+  session.append('turn/start', { turn })
+  const passthroughTool = await runLlmStream([
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: 'call-legacy', name: 'write', argumentsDelta: '{}' },
+    { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-legacy', name: 'write', arguments: '{}' } },
+    {
+      type: 'finish',
+      reason: { kind: 'max-tokens' },
+      replayState: {
+        response: { kind: 'pi-ai', version: 2, provider: 'mock', model: 'mock', api: 'openai-completions', stopReason: 'length' },
+        blocks: [{ type: 'tool-call' }],
+      },
+    },
+  ])
+  if (passthroughTool.at(-1)?.reason?.kind !== 'tool-calls') throw new Error('passthrough policy did not preserve capped closed tool call')
+  if (!passthroughTool.some((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call')) {
+    throw new Error('passthrough policy unexpectedly dropped the capped tool call')
+  }
+  if (passthroughTool.at(-1)?.replayState?.response?.stopReason !== 'toolUse') {
+    throw new Error('passthrough policy did not mask pi-ai length as toolUse')
+  }
+  if (steers.length !== 2) throw new Error('passthrough closed tool call must not add a steer')
+  if (!logs.some((line) => line.includes('policy=passthrough') && line.includes('mask=tool-calls'))) {
+    throw new Error('passthrough diagnostic marker missing')
+  }
+  session.append('turn/end', { turn, reason: { kind: 'completed' } })
+  config.steerToolCallPolicy = 'discard'
 
   // The cap limits injected steer messages, but max-tokens remains hidden even
   // when the cap prevents another injection.
