@@ -32,39 +32,53 @@ async function hostTests() {
   const host = await import('file:///' + hostFile.replace(/\\/g, '/'))
   if (host.name !== 'dsh-continue-on-limit-host') throw new Error('unexpected host name: ' + host.name)
   if (!host.inject.includes('agents') || !host.inject.includes('profileContext')) throw new Error('host injects are incomplete')
-  if (typeof host.Config !== 'function' && typeof host.Config !== 'object') throw new Error('Config export missing')
-  if (host.DEFAULTS.includeSubagents !== true || host.DEFAULTS.minIntervalMs !== 0) {
-    throw new Error('subagent-safe defaults are wrong: ' + JSON.stringify(host.DEFAULTS))
-  }
+  if (host.DEFAULTS.continuationMode !== 'followup') throw new Error('followup must remain the default mode')
 
   const listeners = new Map()
   const settingsCalls = []
-  const sent = []
+  const followups = []
+  const steers = []
   const logs = []
   const events = []
   const inbox = { nextTurn: [], nextStep: [] }
+  let seq = 1
+
   const session = {
     id: 'root-1',
     header: {},
     snapshotEvents() { return [...events] },
+    append(type, data, opts) {
+      const event = { type, seq: seq++, data, ...(opts ?? {}) }
+      events.push(event)
+      for (const cb of listeners.get('session/event') ?? []) cb(session, event)
+      return event
+    },
   }
+
   const agent = {
     session,
     status: 'running',
     inbox,
     followup(message) {
-      sent.push(message)
+      followups.push(message)
       inbox.nextTurn.push(message)
     },
+    steer(message) {
+      steers.push(message)
+      inbox.nextStep.push(message)
+    },
   }
+
   const config = {
     enabled: true,
+    continuationMode: 'followup',
     continueText: '继续',
     maxConsecutive: 3,
     minIntervalMs: 0,
     includeSubagents: true,
-    debugLogging: false,
+    debugLogging: true,
   }
+
   const cleanup = []
   const ctx = {
     fiber: {},
@@ -91,101 +105,105 @@ async function hostTests() {
       }
     },
   }
+
   host.apply(ctx, config)
   if (settingsCalls.length !== 1 || settingsCalls[0].auto !== false) throw new Error('settings custom-page registration missing')
 
-  let seq = 1
-  let turn = 0
-  const emitSession = (event) => {
-    events.push(event)
-    for (const cb of listeners.get('session/event') ?? []) cb(session, event)
-  }
-  const emitStopping = async (number) => {
-    const payload = { agent, turn: number, signal: new AbortController().signal }
+  const emitStopping = async (turn) => {
+    const payload = { agent, turn, signal: new AbortController().signal }
     for (const cb of listeners.get('agent/turn-stopping') ?? []) await cb(payload)
   }
   const finishStream = (kind) => [{ type: 'chunk', time: Date.now(), chunk: { type: 'finish', reason: { kind } } }]
-  const runMax = async () => {
-    turn += 1
-    emitSession({ type: 'turn/start', seq: seq++, data: { turn } })
-    emitSession({
-      type: 'assistant/message',
-      seq: seq++,
-      data: {
-        turn,
-        step: 1,
-        message: { id: 'assistant-' + turn, role: 'assistant', content: [], source: { provider: 'mock', model: 'mock' } },
-        stream: finishStream('max-tokens'),
-      },
-      surfaceOp: 'append',
-    })
-    await emitStopping(turn)
-    emitSession({ type: 'turn/end', seq: seq++, data: { turn, reason: { kind: 'max-tokens' } } })
-    // Simulate AgentLoop claiming the queued next-turn message before the next turn.
-    inbox.nextTurn.length = 0
-  }
-  const runCompleted = () => {
-    turn += 1
-    emitSession({ type: 'turn/start', seq: seq++, data: { turn } })
-    emitSession({ type: 'turn/end', seq: seq++, data: { turn, reason: { kind: 'completed' } } })
-  }
+  const assistant = (turn, step, kind) => session.append('assistant/message', {
+    turn,
+    step,
+    message: {
+      id: 'assistant-' + turn + '-' + step,
+      role: 'assistant',
+      content: [{ type: 'text', text: kind }],
+      source: { kind: 'model', provider: 'mock', model: 'mock' },
+    },
+    stream: finishStream(kind),
+  }, { surfaceOp: 'append' })
 
-  config.debugLogging = true
-  await runMax()
-  if (!logs.some(line => line.includes('MAX_TOKENS_PRESTOP_CAPTURED'))) {
-    throw new Error('debug log did not report MAX_TOKENS_PRESTOP_CAPTURED')
-  }
-  if (!logs.some(line => line.includes('AUTO_CONTINUE_QUEUED_PRE_TURN_END'))) {
-    throw new Error('debug log did not report AUTO_CONTINUE_QUEUED_PRE_TURN_END')
-  }
-  if (!logs.some(line => line.includes('MAX_TOKENS_CONFIRMED') && line.includes('prestopHandled=true'))) {
-    throw new Error('turn/end did not confirm prestop handling')
-  }
-  config.debugLogging = false
-  if (sent.length !== 1 || sent[0].content?.[0]?.text !== '继续') throw new Error('max-tokens did not queue a continuation')
-  if (sent[0].source?.kind !== 'dsh-continue-on-limit-host') throw new Error('continuation must use the plugin-owned source kind')
-
-  await runMax()
-  await runMax()
-  if (sent.length !== 3) throw new Error('three consecutive max-tokens turns should produce three continuations')
-  await runMax()
-  if (sent.length !== 3) throw new Error('maxConsecutive cap was not enforced')
-
-  runCompleted()
-  await runMax()
-  if (sent.length !== 4) throw new Error('normal completion did not reset the chain')
-
-  inbox.nextTurn.push({})
-  turn += 1
-  emitSession({ type: 'turn/start', seq: seq++, data: { turn } })
-  emitSession({
-    type: 'assistant/message', seq: seq++,
-    data: { turn, step: 1, message: { id: 'assistant-pending', role: 'assistant', content: [], source: { provider: 'mock', model: 'mock' } }, stream: finishStream('max-tokens') },
-    surfaceOp: 'append',
-  })
+  // FOLLOW-UP MODE: exactly one next-turn send; no steer.
+  let turn = 1
+  session.append('turn/start', { turn })
+  assistant(turn, 1, 'max-tokens')
   await emitStopping(turn)
-  if (sent.length !== 4) throw new Error('pending inbox work must block auto-continue')
+  if (followups.length !== 1) throw new Error('followup mode did not queue exactly one followup')
+  if (steers.length !== 0) throw new Error('followup mode must never steer')
+  if (inbox.nextTurn.length !== 1 || inbox.nextStep.length !== 0) throw new Error('followup mode queued the wrong inbox target')
+  const followupEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
+  if (followupEnd.data.reason.kind !== 'max-tokens') throw new Error('followup mode must preserve native max-tokens turn/end')
+  if (!logs.some(line => line.includes('FOLLOWUP_QUEUED'))) throw new Error('followup diagnostic marker missing')
   inbox.nextTurn.length = 0
-  emitSession({ type: 'turn/end', seq: seq++, data: { turn, reason: { kind: 'max-tokens' } } })
 
-  session.header.origin = 'subagent'
-  config.includeSubagents = false
-  await runMax()
-  if (sent.length !== 4) throw new Error('includeSubagents=false should skip the child')
+  // Normal completion resets the followup chain.
+  turn += 1
+  session.append('turn/start', { turn })
+  assistant(turn, 1, 'stop')
+  await emitStopping(turn)
+  session.append('turn/end', { turn, reason: { kind: 'completed' } })
 
-  config.includeSubagents = true
-  config.minIntervalMs = 0
-  await runMax()
-  if (sent.length !== 5) throw new Error('subagent continuation must queue at turn-stopping before turn/end')
-  session.header.origin = undefined
+  // STEER MODE: same-turn next-step recovery and plugin-only sticky outcome normalization.
+  config.continuationMode = 'steer'
+  turn += 1
+  session.append('turn/start', { turn })
+  assistant(turn, 1, 'max-tokens')
+  await emitStopping(turn)
+  if (followups.length !== 1) throw new Error('steer mode must not call followup')
+  if (steers.length !== 1) throw new Error('steer mode did not queue exactly one steer')
+  if (inbox.nextStep.length !== 1 || inbox.nextTurn.length !== 0) throw new Error('steer mode queued the wrong inbox target')
+  if (!logs.some(line => line.includes('STEER_TURN_END_REWRITE_ARMED'))) throw new Error('steer rewrite was not armed')
 
-  emitSession({ type: 'user/message', seq: seq++, data: { source: { kind: 'user' } } })
-  await runMax()
-  if (sent.length !== 6) throw new Error('human input did not reset the chain')
+  // AgentLoop claims the steering and runs the next step in the SAME turn.
+  inbox.nextStep.length = 0
+  assistant(turn, 2, 'stop')
+  await emitStopping(turn)
+  if (steers.length !== 1) throw new Error('clean recovery stop must not steer again')
+
+  // Native AgentLoop would still write max-tokens because it is sticky. The
+  // plugin's one-shot Session.append wrapper must normalize only this turn-end.
+  const steerEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
+  if (steerEnd.data.reason.kind !== 'completed') throw new Error('steer recovery did not normalize sticky max-tokens to completed')
+  if (!logs.some(line => line.includes('STEER_TURN_END_REWRITTEN'))) throw new Error('steer rewrite diagnostic marker missing')
+
+  // Provider-level truth remains durable: the first step is still max-tokens.
+  const firstSteerAssistant = events.find(event => event.type === 'assistant/message' && event.data.turn === turn && event.data.step === 1)
+  const firstFinish = firstSteerAssistant?.data.stream?.find(record => record.type === 'chunk' && record.chunk?.type === 'finish')
+  if (firstFinish?.chunk?.reason?.kind !== 'max-tokens') throw new Error('steer mode must preserve provider-level max-tokens history')
+
+  // Repeated max-tokens in steer mode adds one steer per capped step, still no followup.
+  turn += 1
+  session.append('turn/start', { turn })
+  assistant(turn, 1, 'max-tokens')
+  await emitStopping(turn)
+  inbox.nextStep.length = 0
+  assistant(turn, 2, 'max-tokens')
+  await emitStopping(turn)
+  if (steers.length !== 3) throw new Error('steer mode must continue once per max-tokens step')
+  if (followups.length !== 1) throw new Error('steer mode leaked into followup path')
+  inbox.nextStep.length = 0
+  assistant(turn, 3, 'stop')
+  await emitStopping(turn)
+  const repeatedSteerEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
+  if (repeatedSteerEnd.data.reason.kind !== 'completed') throw new Error('multi-step steer recovery did not complete cleanly')
+
+  // Hot mode switch is a hard boundary; next max-tokens uses followup only.
+  config.continuationMode = 'followup'
+  turn += 1
+  session.append('turn/start', { turn })
+  assistant(turn, 1, 'max-tokens')
+  await emitStopping(turn)
+  if (followups.length !== 2) throw new Error('mode switch back to followup did not select followup path')
+  if (steers.length !== 3) throw new Error('mode switch back to followup leaked a steer')
+  session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
+  inbox.nextTurn.length = 0
 
   for (const dispose of cleanup.reverse()) await dispose()
   fs.rmSync(path.join(root, '.test-dsh-home'), { recursive: true, force: true })
-  console.log('OK: host prestop max-tokens policy')
+  console.log('OK: isolated followup and steer max-tokens policies')
 }
 
 async function clientTests() {
