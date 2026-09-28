@@ -30,6 +30,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function hostTests() {
   const host = await import('file:///' + hostFile.replace(/\\/g, '/'))
+  const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
   if (host.name !== 'dsh-continue-on-limit-host') throw new Error('unexpected host name: ' + host.name)
   if (!host.inject.includes('agents') || !host.inject.includes('profileContext')) throw new Error('host injects are incomplete')
   if (host.DEFAULTS.continuationMode !== 'followup') throw new Error('followup must remain the default mode')
@@ -113,9 +114,24 @@ async function hostTests() {
     const payload = { agent, turn, signal: new AbortController().signal }
     for (const cb of listeners.get('agent/turn-stopping') ?? []) await cb(payload)
   }
-  const emitToolResult = async (name, result = {}) => {
-    const exec = { name, agent, parent: undefined }
-    for (const cb of listeners.get('tools/result') ?? []) await cb(exec, { isError: false, ...result })
+  const runLlmStream = async (chunks) => {
+    const options = markAgentLoopRequest({
+      provider: 'mock',
+      model: 'mock',
+      messages: [],
+      sessionId: session.id,
+      signal: new AbortController().signal,
+    })
+    let stream = (async function* () { yield* chunks })()
+    const callbacks = [...(listeners.get('llm/stream') ?? [])]
+    for (let index = callbacks.length - 1; index >= 0; index -= 1) {
+      const cb = callbacks[index]
+      const downstream = stream
+      stream = cb(options, () => downstream)
+    }
+    const out = []
+    for await (const chunk of stream) out.push(chunk)
+    return out
   }
   const finishStream = (kind) => [{ type: 'chunk', time: Date.now(), chunk: { type: 'finish', reason: { kind } } }]
   const assistant = (turn, step, kind) => session.append('assistant/message', {
@@ -150,98 +166,86 @@ async function hostTests() {
   await emitStopping(turn)
   session.append('turn/end', { turn, reason: { kind: 'completed' } })
 
-  // STEER MODE: same-turn next-step recovery and plugin-only sticky outcome normalization.
+  // STEER MODE: max-tokens is a private plugin trigger. AgentLoop sees
+  // only the masked terminal reason and the queued next-step steer.
   config.continuationMode = 'steer'
   turn += 1
   session.append('turn/start', { turn })
-  assistant(turn, 1, 'max-tokens')
-  await emitStopping(turn)
-  if (followups.length !== 1) throw new Error('steer mode must not call followup')
-  if (steers.length !== 1) throw new Error('steer mode did not queue exactly one steer')
-  if (inbox.nextStep.length !== 1 || inbox.nextTurn.length !== 0) throw new Error('steer mode queued the wrong inbox target')
-  if (!logs.some(line => line.includes('STEER_TURN_END_REWRITE_ARMED'))) throw new Error('steer rewrite was not armed')
-
-  // AgentLoop claims the steering and runs the next step in the SAME turn.
-  inbox.nextStep.length = 0
-  assistant(turn, 2, 'stop')
-  await emitStopping(turn)
-  if (steers.length !== 1) throw new Error('clean recovery stop must not steer again')
-
-  // Native AgentLoop would still write max-tokens because it is sticky. The
-  // plugin's one-shot Session.append wrapper must normalize only this turn-end.
-  const steerEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
-  if (steerEnd.data.reason.kind !== 'completed') throw new Error('steer recovery did not normalize sticky max-tokens to completed')
-  if (!logs.some(line => line.includes('STEER_TURN_END_REWRITTEN'))) throw new Error('steer rewrite diagnostic marker missing')
-
-  // Provider-level truth remains durable: the first step is still max-tokens.
-  const firstSteerAssistant = events.find(event => event.type === 'assistant/message' && event.data.turn === turn && event.data.step === 1)
-  const firstFinish = firstSteerAssistant?.data.stream?.find(record => record.type === 'chunk' && record.chunk?.type === 'finish')
-  if (firstFinish?.chunk?.reason?.kind !== 'max-tokens') throw new Error('steer mode must preserve provider-level max-tokens history')
-
-  // STEER TOOL LOOP: an ordinary tool-calls recovery step must not close
-  // merely because the earlier max-tokens outcome is sticky. The plugin adds
-  // one same-turn bridge steer, then a later clean stop closes normally.
-  turn += 1
-  session.append('turn/start', { turn })
-  assistant(turn, 1, 'max-tokens')
-  await emitStopping(turn)
-  inbox.nextStep.length = 0
-  assistant(turn, 2, 'tool-calls')
-  await emitStopping(turn)
-  if (steers.length !== 3) throw new Error('steer recovery tool-call step did not queue the tool-loop bridge')
-  if (!logs.some(line => line.includes('STEER_TOOL_LOOP_BRIDGE_QUEUED'))) throw new Error('steer tool-loop bridge diagnostic marker missing')
-  inbox.nextStep.length = 0
-  assistant(turn, 3, 'stop')
-  await emitStopping(turn)
-  const toolLoopEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
-  if (toolLoopEnd.data.reason.kind !== 'completed') throw new Error('steer tool-loop recovery did not complete cleanly')
-
-  // A tool result that explicitly concludes the turn is terminal and must not
-  // receive the bridge steer. It is also a clean recovery terminal for the
-  // aggregate sticky max-tokens rewrite.
-  turn += 1
-  session.append('turn/start', { turn })
-  assistant(turn, 1, 'max-tokens')
-  await emitStopping(turn)
-  inbox.nextStep.length = 0
-  assistant(turn, 2, 'tool-calls')
-  await emitToolResult('finalize', { concludesTurn: true })
-  await emitStopping(turn)
-  if (steers.length !== 4) throw new Error('concluding tool must not receive a tool-loop bridge steer')
-  if (!logs.some(line => line.includes('STEER_CONCLUDING_TOOL_CAPTURED'))) throw new Error('concluding tool diagnostic marker missing')
-  const concludingToolEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
-  if (concludingToolEnd.data.reason.kind !== 'completed') throw new Error('concluding tool recovery did not normalize sticky max-tokens')
-
-  // Repeated max-tokens in steer mode adds one steer per capped step, still no followup.
-  turn += 1
-  session.append('turn/start', { turn })
-  assistant(turn, 1, 'max-tokens')
-  await emitStopping(turn)
-  inbox.nextStep.length = 0
-  assistant(turn, 2, 'max-tokens')
-  await emitStopping(turn)
-  if (steers.length !== 6) throw new Error('steer mode must continue once per max-tokens step')
+  const masked = await runLlmStream([{
+    type: 'finish',
+    reason: { kind: 'max-tokens' },
+    replayState: {
+      response: { kind: 'pi-ai', version: 2, provider: 'mock', model: 'mock', api: 'openai-completions', stopReason: 'length' },
+      blocks: [],
+    },
+  }])
+  if (masked.length !== 1 || masked[0].reason.kind !== 'stop') throw new Error('steer mode did not hide max-tokens as stop')
+  if (masked[0].replayState?.response?.stopReason !== 'stop') throw new Error('steer mode did not sanitize pi-ai replay stopReason')
+  if (steers.length !== 1) throw new Error('steer mode did not queue exactly one next-step steer')
   if (followups.length !== 1) throw new Error('steer mode leaked into followup path')
-  inbox.nextStep.length = 0
-  assistant(turn, 3, 'stop')
-  await emitStopping(turn)
-  const repeatedSteerEnd = session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
-  if (repeatedSteerEnd.data.reason.kind !== 'completed') throw new Error('multi-step steer recovery did not complete cleanly')
+  if (inbox.nextStep.length !== 1 || inbox.nextTurn.length !== 0) throw new Error('steer mode queued the wrong inbox target')
+  if (!logs.some(line => line.includes('STEER_MAX_TOKENS_INTERCEPTED'))) throw new Error('transparent steer interception marker missing')
 
-  // Hot mode switch is a hard boundary; next max-tokens uses followup only.
+  // Simulate AgentLoop claiming the steer. The durable Assistant settlement
+  // contains only the masked finish; turn/end is therefore natively completed.
+  inbox.nextStep.length = 0
+  assistant(turn, 1, 'stop')
+  await emitStopping(turn)
+  const transparentEnd = session.append('turn/end', { turn, reason: { kind: 'completed' } })
+  if (transparentEnd.data.reason.kind !== 'completed') throw new Error('transparent steer turn did not remain completed')
+
+  // If a capped response already contains a complete tool call, expose
+  // tool-calls instead of max-tokens and let the native tool loop continue.
+  turn += 1
+  session.append('turn/start', { turn })
+  const toolMasked = await runLlmStream([
+    { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1', name: 'write', arguments: '{}' } },
+    {
+      type: 'finish',
+      reason: { kind: 'max-tokens' },
+      replayState: {
+        response: { kind: 'pi-ai', version: 2, provider: 'mock', model: 'mock', api: 'openai-completions', stopReason: 'length' },
+        blocks: [{ type: 'tool-call' }],
+      },
+    },
+  ])
+  if (toolMasked.at(-1)?.reason?.kind !== 'tool-calls') throw new Error('complete capped tool call was not masked as tool-calls')
+  if (toolMasked.at(-1)?.replayState?.response?.stopReason !== 'toolUse') throw new Error('tool-call replay stopReason was not sanitized')
+  if (steers.length !== 1) throw new Error('native tool-loop path must not add a redundant steer')
+  session.append('turn/end', { turn, reason: { kind: 'completed' } })
+
+  // The cap limits injected steer messages, but max-tokens remains hidden even
+  // when the cap prevents another injection.
+  config.maxConsecutive = 1
+  turn += 1
+  session.append('turn/start', { turn })
+  const firstCapped = await runLlmStream([{ type: 'finish', reason: { kind: 'max-tokens' } }])
+  if (firstCapped[0]?.reason?.kind !== 'stop') throw new Error('first capped finish leaked max-tokens')
+  if (steers.length !== 2) throw new Error('first capped finish did not steer')
+  inbox.nextStep.length = 0
+  const secondCapped = await runLlmStream([{ type: 'finish', reason: { kind: 'max-tokens' } }])
+  if (secondCapped[0]?.reason?.kind !== 'stop') throw new Error('maxConsecutive path leaked max-tokens')
+  if (steers.length !== 2) throw new Error('maxConsecutive should suppress the second steer')
+  session.append('turn/end', { turn, reason: { kind: 'completed' } })
+  config.maxConsecutive = 3
+
+  // Hot mode switch is a hard boundary. Follow-up mode must leave the
+  // provider max-tokens finish untouched and handle it at turn-stopping.
   config.continuationMode = 'followup'
   turn += 1
   session.append('turn/start', { turn })
+  const raw = await runLlmStream([{ type: 'finish', reason: { kind: 'max-tokens' } }])
+  if (raw[0]?.reason?.kind !== 'max-tokens') throw new Error('followup mode must not mask max-tokens')
   assistant(turn, 1, 'max-tokens')
   await emitStopping(turn)
   if (followups.length !== 2) throw new Error('mode switch back to followup did not select followup path')
-  if (steers.length !== 6) throw new Error('mode switch back to followup leaked a steer')
+  if (steers.length !== 2) throw new Error('mode switch back to followup leaked a steer')
   session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
   inbox.nextTurn.length = 0
 
   for (const dispose of cleanup.reverse()) await dispose()
   fs.rmSync(path.join(root, '.test-dsh-home'), { recursive: true, force: true })
-  console.log('OK: isolated followup and steer max-tokens policies')
+  console.log('OK: followup preserves max-tokens; steer masks it before AgentLoop')
 }
 
 async function clientTests() {
