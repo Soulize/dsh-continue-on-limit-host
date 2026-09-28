@@ -40,6 +40,7 @@ async function hostTests() {
   const listeners = new Map()
   const settingsCalls = []
   const sent = []
+  const logs = []
   const session = { id: 'root-1', header: {} }
   const agent = {
     session,
@@ -52,12 +53,13 @@ async function hostTests() {
     maxConsecutive: 3,
     minIntervalMs: 0,
     includeSubagents: true,
+    debugLogging: false,
   }
   const cleanup = []
   const ctx = {
     fiber: {},
     agents: { get: (id) => id === session.id ? agent : undefined },
-    logger: { info() {}, warn() {} },
+    logger: { info(message) { logs.push(String(message)) }, warn(message) { logs.push(String(message)) } },
     on(name, cb) {
       const list = listeners.get(name) ?? []
       list.push(cb)
@@ -88,8 +90,19 @@ async function hostTests() {
   const max = () => emitSession({ type: 'turn/end', seq: seq++, data: { turn: seq, reason: { kind: 'max-tokens' } } })
   const completed = () => emitSession({ type: 'turn/end', seq: seq++, data: { turn: seq, reason: { kind: 'completed' } } })
 
+  config.debugLogging = true
   max()
   await delay(5)
+  if (!logs.some(line => line.includes('TURN_END_CAPTURED') && line.includes('reason=max-tokens'))) {
+    throw new Error('debug log did not report TURN_END_CAPTURED max-tokens')
+  }
+  if (!logs.some(line => line.includes('MAX_TOKENS_CAPTURED'))) {
+    throw new Error('debug log did not report MAX_TOKENS_CAPTURED')
+  }
+  if (!logs.some(line => line.includes('AUTO_CONTINUE_QUEUED'))) {
+    throw new Error('debug log did not report AUTO_CONTINUE_QUEUED')
+  }
+  config.debugLogging = false
   if (sent.length !== 1 || sent[0].content?.[0]?.text !== '继续') throw new Error('max-tokens did not queue a continuation')
   if (sent[0].source?.kind !== 'dsh-continue-on-limit-host') throw new Error('continuation must use the plugin-owned source kind')
 
