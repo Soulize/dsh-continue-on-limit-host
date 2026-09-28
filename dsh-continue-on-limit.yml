@@ -4,6 +4,7 @@
       config:
         enabled: true
         continuationMode: 'followup'
+        steerToolCallPolicy: 'discard'
         continueText: '继续'
         maxConsecutive: 3
         minIntervalMs: 0
