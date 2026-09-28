@@ -70,6 +70,30 @@ DSH 0.1.7 的 Plugins 安装界面也可以使用同一个 GitHub spec：
 github:Soulize/dsh-continue-on-limit-host
 ```
 
+### GitHub 安装源的更新限制（DSH 0.1.7-rc.2）
+
+DSH 0.1.7-rc.2 的 Plugin Manager 在 `installBundle()` 完成后，会比较 profile `package.json` 的 `dependencies` 前后值来推断“本次安装/更新的是哪个包”。如果一个已经安装的 GitHub spec 再次使用完全相同的地址，例如：
+
+```text
+github:Soulize/dsh-continue-on-limit-host
+```
+
+pnpm 可以更新 lockfile / node_modules，但 `package.json` 中该 dependency 的 spec 可能保持不变。此时 DSH 看不到唯一的 dependency 变化，会报：
+
+```text
+无法从依赖变更中确定安装了哪一个包
+```
+
+这是 DSH 0.1.7-rc.2 对重复 Git spec 的识别限制，不是插件 bundle metadata 缺失。
+
+使用 GitHub 分发时，更新建议显式改变 ref，例如：
+
+```powershell
+dsh plugin --profile web add github:Soulize/dsh-continue-on-limit-host#<new-commit-sha>
+```
+
+或者先卸载后安装新的 GitHub ref。若需要 Plugin Manager 中更自然的按包名更新流程，建议发布到 npm，并使用包名 / `name@version` 安装，因为 DSH 对 registry spec 有按 package name 的回退识别。
+
 ### npm 发布是可选的
 
 本仓库已经补齐 npm 元数据和 `publishConfig`。如果以后希望用户直接执行：
