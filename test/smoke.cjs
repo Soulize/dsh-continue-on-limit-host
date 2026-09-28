@@ -194,24 +194,57 @@ async function hostTests() {
   const transparentEnd = session.append('turn/end', { turn, reason: { kind: 'completed' } })
   if (transparentEnd.data.reason.kind !== 'completed') throw new Error('transparent steer turn did not remain completed')
 
-  // If a capped response already contains a complete tool call, expose
-  // tool-calls instead of max-tokens and let the native tool loop continue.
+  // Any tool call in a capped response is discarded, even if the adapter
+  // emitted block-end. DSH's native BlockAssembler makes the same safety
+  // choice for max-tokens responses.
   turn += 1
   session.append('turn/start', { turn })
   const toolMasked = await runLlmStream([
-    { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1', name: 'write', arguments: '{}' } },
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: 'call-1', name: 'write', argumentsDelta: '{"file_path":"x"' },
+    { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1', name: 'write', arguments: '{"file_path":"x"' } },
+    { type: 'block-start', index: 1, blockType: 'text' },
+    { type: 'text-delta', index: 1, text: 'after tool' },
+    { type: 'block-end', index: 1, block: { type: 'text', text: 'after tool' } },
     {
       type: 'finish',
       reason: { kind: 'max-tokens' },
       replayState: {
         response: { kind: 'pi-ai', version: 2, provider: 'mock', model: 'mock', api: 'openai-completions', stopReason: 'length' },
-        blocks: [{ type: 'tool-call' }],
+        blocks: [{ type: 'tool-call' }, { type: 'text' }],
       },
     },
   ])
-  if (toolMasked.at(-1)?.reason?.kind !== 'tool-calls') throw new Error('complete capped tool call was not masked as tool-calls')
-  if (toolMasked.at(-1)?.replayState?.response?.stopReason !== 'toolUse') throw new Error('tool-call replay stopReason was not sanitized')
-  if (steers.length !== 1) throw new Error('native tool-loop path must not add a redundant steer')
+  if (toolMasked.some((chunk) =>
+    chunk.type === 'tool-call-delta'
+    || (chunk.type === 'block-start' && chunk.blockType === 'tool-call')
+    || (chunk.type === 'block-end' && chunk.block?.type === 'tool-call')
+  )) throw new Error('capped tool call leaked through transparent steer')
+  if (!toolMasked.some((chunk) => chunk.type === 'text-delta' && chunk.text === 'after tool')) throw new Error('non-tool suffix was lost while dropping capped tool calls')
+  if (toolMasked.at(-1)?.reason?.kind !== 'stop') throw new Error('capped tool response did not mask max-tokens as stop')
+  if (toolMasked.at(-1)?.replayState?.response?.stopReason !== 'stop') throw new Error('capped tool replay stopReason was not sanitized')
+  if (toolMasked.at(-1)?.replayState?.blocks?.length !== 1 || toolMasked.at(-1)?.replayState?.blocks?.[0]?.type !== 'text') {
+    throw new Error('capped tool replay metadata was not pruned with the dropped tool call')
+  }
+  if (steers.length !== 2) throw new Error('capped tool response did not queue a steer')
+  inbox.nextStep.length = 0
+  session.append('turn/end', { turn, reason: { kind: 'completed' } })
+
+  // A normal tool-calls response is not altered: held tool chunks flush in
+  // original order and no continuation is injected.
+  turn += 1
+  session.append('turn/start', { turn })
+  const normalTool = await runLlmStream([
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: 'call-2', name: 'write', argumentsDelta: '{}' },
+    { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-2', name: 'write', arguments: '{}' } },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ])
+  if (normalTool.at(-1)?.reason?.kind !== 'tool-calls') throw new Error('normal tool-calls finish was modified')
+  if (!normalTool.some((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call')) {
+    throw new Error('normal tool call was not flushed')
+  }
+  if (steers.length !== 2) throw new Error('normal tool-calls response must not steer')
   session.append('turn/end', { turn, reason: { kind: 'completed' } })
 
   // The cap limits injected steer messages, but max-tokens remains hidden even
@@ -221,11 +254,11 @@ async function hostTests() {
   session.append('turn/start', { turn })
   const firstCapped = await runLlmStream([{ type: 'finish', reason: { kind: 'max-tokens' } }])
   if (firstCapped[0]?.reason?.kind !== 'stop') throw new Error('first capped finish leaked max-tokens')
-  if (steers.length !== 2) throw new Error('first capped finish did not steer')
+  if (steers.length !== 3) throw new Error('first capped finish did not steer')
   inbox.nextStep.length = 0
   const secondCapped = await runLlmStream([{ type: 'finish', reason: { kind: 'max-tokens' } }])
   if (secondCapped[0]?.reason?.kind !== 'stop') throw new Error('maxConsecutive path leaked max-tokens')
-  if (steers.length !== 2) throw new Error('maxConsecutive should suppress the second steer')
+  if (steers.length !== 3) throw new Error('maxConsecutive should suppress the second steer')
   session.append('turn/end', { turn, reason: { kind: 'completed' } })
   config.maxConsecutive = 3
 
@@ -239,7 +272,7 @@ async function hostTests() {
   assistant(turn, 1, 'max-tokens')
   await emitStopping(turn)
   if (followups.length !== 2) throw new Error('mode switch back to followup did not select followup path')
-  if (steers.length !== 2) throw new Error('mode switch back to followup leaked a steer')
+  if (steers.length !== 3) throw new Error('mode switch back to followup leaked a steer')
   session.append('turn/end', { turn, reason: { kind: 'max-tokens' } })
   inbox.nextTurn.length = 0
 
