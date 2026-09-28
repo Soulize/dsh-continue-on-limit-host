@@ -166,7 +166,7 @@ agent.inbox.nextStep
 
 ### Subagent
 
-`includeSubagents=true` 为默认值。官方 continuable child 命中 `max-tokens` 后会自然 settlement，并给 parent 投递 `subagent-settled` 通知，但不会自己再跑一轮；因此插件会在 child 的 `turn/end(max-tokens)` 事件处理中同步 `followup()`，让下一轮在 Activation 结算前进入 inbox。若手动关闭该开关，则跳过 `session.header.origin === "subagent"`。
+`includeSubagents=true` 为默认值。官方 continuable child 命中 `max-tokens` 后不会自己再跑一轮。由于 `session/event` 是同步发布且 `Session.append()` 禁止重入，插件不能在 `turn/end` listener 内直接调用 `followup()`；它会在该事件发布完成后的下一个 microtask 调用 `followup()`。这也是 Harness 自身测试采用的 session-listener send 模式，并且会早于 child 进入后续 idle settlement 检查。若手动关闭该开关，则跳过 `session.header.origin === "subagent"`。
 
 ## 开发 / 自检
 
@@ -226,7 +226,7 @@ SESSION_DISPOSED
 ```text
 TURN_END_CAPTURED ... reason=max-tokens ... origin=subagent
 MAX_TOKENS_CAPTURED ...
-... subagent path: synchronous followup
+... subagent path: queueMicrotask followup
 ... calling agent.followup ...
 AUTO_CONTINUE_QUEUED ...
 ```
@@ -254,3 +254,14 @@ AUTO_CONTINUE_QUEUED
 ```
 
 但 UI 仍未出现下一轮模型请求，则应继续检查 Agent inbox claim / driver wakeup 路径。
+
+
+### 为什么不是在 `turn/end` listener 里直接 `followup()`
+
+DSH 的 `session/event` 是同步发布的，而 `agent.followup()` 会向同一个 Session 追加 `user/message`。因此如果在 `turn/end` 的 listener 调用栈里直接执行，会触发：
+
+```text
+Error: session append cannot reenter while another append is being published
+```
+
+本插件从 0.2.4 起改为 `queueMicrotask(() => agent.followup(...))`。这样先让当前 `turn/end` append 完成，再在同一事件循环 tick 的微任务阶段排队下一 turn。
