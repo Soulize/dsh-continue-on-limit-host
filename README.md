@@ -99,6 +99,7 @@ dsh plugin --profile web add dsh-continue-on-limit-host
 | `maxConsecutive` | `3` | 连续自动继续次数；`0` 表示不限次数 |
 | `minIntervalMs` | `0` | 普通主会话的最小发送间隔；Subagent 为避免 Activation 先结算会同步入队，不等待延迟 |
 | `includeSubagents` | `true` | 是否同时处理 `origin: subagent` 的会话；默认开启 |
+| `debugLogging` | `false` | 输出 Host 诊断日志，用于确认是否捕获 `max-tokens` 以及为何没有续写 |
 
 这些值属于当前 profile 的插件 Config。UI 保存后由 Harness ConfigEditor 写回 profile patch，并通过 volatile config 热更新到正在运行的插件。
 
@@ -162,3 +163,58 @@ npm test
 ## License
 
 MIT
+
+
+## 诊断日志
+
+在插件管理页打开 `启用诊断日志` 后，Host 会用统一前缀输出：
+
+```text
+[dsh-continue-on-limit-host][debug]
+```
+
+重点看以下事件：
+
+```text
+TURN_END_CAPTURED
+MAX_TOKENS_CAPTURED
+AUTO_CONTINUE_QUEUED
+AUTO_CONTINUE_SKIPPED
+AUTO_CONTINUE_FAILED
+SUBAGENT_END
+SESSION_DISPOSED
+```
+
+理想的 Subagent 截断续写链路应该出现：
+
+```text
+TURN_END_CAPTURED ... reason=max-tokens ... origin=subagent
+MAX_TOKENS_CAPTURED ...
+... subagent path: synchronous followup
+... calling agent.followup ...
+AUTO_CONTINUE_QUEUED ...
+```
+
+如果只看到：
+
+```text
+SUBAGENT_END ... stopReason=max-tokens
+```
+
+却没有 `MAX_TOKENS_CAPTURED`，说明 lifecycle 看到了 token 上限，但 `session/event` 监听没有收到该 child 的 `turn/end`。
+
+如果看到了 `MAX_TOKENS_CAPTURED`，随后出现：
+
+```text
+skip: liveAgent=no
+```
+
+说明事件抓到了，但 child Agent 在续写前已经不在 registry 中。
+
+如果出现：
+
+```text
+AUTO_CONTINUE_QUEUED
+```
+
+但 UI 仍未出现下一轮模型请求，则应继续检查 Agent inbox claim / driver wakeup 路径。
