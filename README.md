@@ -45,14 +45,21 @@ max-tokens 仅作为插件内部触发信号
 AgentLoop 从未进入 sticky max-tokens 状态
 ```
 
-即使截断响应里已经出现 `tool-call` 的 `block-end`，插件也**不会执行它**。DSH 自己的 `BlockAssembler` 在 `finish=max-tokens` 时会丢弃该响应中的全部 tool-call，因为 block 已关闭并不等于这个受截断响应里的工具调用可以安全执行。Steer 0.4.1 保留同一安全语义：
+0.4.2 起，Steer 对“max-tokens 时已经输出的 tool-call”提供两种可选策略。
+
+#### `discard`：0.4.1 安全策略（默认）
+
+DSH 自己的 `BlockAssembler` 在 `finish=max-tokens` 时会丢弃该响应中的全部 tool-call。这个模式保持相同语义：
 
 ```text
 Provider finish=max-tokens
 + zero or more tool-call blocks
         ↓
-插件丢弃该响应中的全部 tool-call chunks
+从第一个 tool-call 起暂存后续 stream
         ↓
+最终确认 max-tokens
+        ↓
+丢弃该响应中的全部 tool-call chunks
 保留 text / reasoning
         ↓
 agent.steer("继续")
@@ -60,28 +67,48 @@ agent.steer("继续")
 对 AgentLoop 输出 finish=stop
 ```
 
-正常的、非 max-tokens 的 `finish=tool-calls` 完全不改，仍交给 DSH 原生工具循环。
+若最终不是 max-tokens，暂存内容会按原顺序全部释放，所以正常 `finish=tool-calls` 不受影响。
 
-因此 Steer 模式下：
+#### `passthrough`：0.4.0 兼容策略
+
+这个模式不暂存 tool-call。chunk 会直接进入 Harness：
+
+```text
+tool-call chunks
+        ↓
+直接进入 Harness
+
+最终 finish=max-tokens
+        ↓
+如果此前至少有一个 tool-call 已 block-end
+    → 对外改成 finish=tool-calls
+    → 不额外 steer
+否则
+    → 对外改成 finish=stop
+    → agent.steer("继续")
+```
+
+它的用途是保留模型在达到输出上限前已经生成的工具调用，避免续写后的模型认为该调用已经发生而跳过它。
+
+这是 0.4.0 的兼容行为：因为 tool-call chunk 已经提前交给 Harness，最终发现 max-tokens 后无法再撤回，因此它会绕过 DSH 原生的“max-tokens 一律丢弃 tool-call”策略。用户需要自行选择这一取舍。
+
+两种策略都满足同一个目标：
 
 - AgentLoop 不会看到 `FinishReason { kind: "max-tokens" }`
-- max-tokens 响应中的 tool-call 不会绕过 DSH 原本的截断安全策略
 - 持久化 `assistant/message.stream` 中不会记录 `max-tokens`
 - 不会触发 DSH 的 sticky `turnEnds=max-tokens`
 - 不需要修改 `Session.append()`
 - 不需要改写 `turn/end`
 - 不需要 tool-loop bridge
-- 正常结束由 DSH 原生写成 `turn/end(completed)`
 
-为避免已经流出的 tool-call 无法撤回，Steer 会从当前响应第一个 tool-call chunk 开始暂存后续 stream：若最终不是 max-tokens，则原样释放；若最终是 max-tokens，则过滤全部 tool-call 后再释放其余内容。
-
-对 shipped pi-ai adapter，插件还会把 replay metadata 中的原生 `stopReason: "length"` 同步改为 `stop`，并按相同 block 顺序删除 tool-call replay entries；DeepSeek Messages 的 replay metadata 本身不保存 stop reason。
+对 shipped pi-ai adapter，`discard` 会把 replay `stopReason: "length"` 改成 `stop` 并删除 tool-call replay entries；`passthrough` 会按最终伪装结果改成 `stop` 或 `toolUse`。DeepSeek Messages 的 replay metadata 本身不保存 stop reason。
 
 ## 配置
 
 ```yaml
 enabled: true
 continuationMode: followup   # followup | steer
+steerToolCallPolicy: discard  # discard | passthrough
 continueText: 继续
 maxConsecutive: 3
 minIntervalMs: 0
@@ -95,13 +122,14 @@ debugLogging: false
 |---|---:|---|
 | `enabled` | `true` | 总开关 |
 | `continuationMode` | `followup` | Follow-up 或透明 Steer |
+| `steerToolCallPolicy` | `discard` | Steer 遇到 max-tokens + tool-call 时：`discard`=0.4.1 暂存并丢弃；`passthrough`=0.4.0 兼容透传 |
 | `continueText` | `继续` | 自动 Steer / Follow-up 的文本 |
 | `maxConsecutive` | `3` | 最多连续注入多少次续写；`0` 不限 |
 | `minIntervalMs` | `0` | 自动注入之间的最小间隔 |
 | `includeSubagents` | `true` | 是否处理 Subagent |
 | `debugLogging` | `false` | 详细日志 |
 
-Steer 模式中，`maxConsecutive` 限制的是插件主动注入的 `agent.steer()` 次数。每次被截获的 max-tokens 响应都会丢弃其中的 tool-call；若允许继续且 inbox 没有既有工作，则注入一次 Steer。
+Steer 模式中，`maxConsecutive` 限制的是插件主动注入的 `agent.steer()` 次数。`discard` 每次截获 max-tokens 都会尝试 Steer；`passthrough` 在已经有 closed tool-call 时改走原生工具执行，不额外消耗一次 Steer 计数。
 
 配置为 volatile，可在 Plugins 页面热更新；模式切换会清空上一模式的连续计数和已处理状态。
 
@@ -121,7 +149,7 @@ if (turnEnds === null || turnEnds.kind !== 'max-tokens') {
 
 所以 Steer 0.4.0 的策略是：**不让这个标识进入 AgentLoop。**
 
-插件只在 `llm/stream` 内部看到真实 max-tokens，然后立即把对外终止原因替换为普通 `stop` / `tool-calls`。这样后续 Step、工具调用和 Turn 收尾全部回到 DSH 原生状态机。
+插件只在 `llm/stream` 内部看到真实 max-tokens，然后按 `steerToolCallPolicy` 把对外终止原因替换为普通 `stop` 或 `tool-calls`。这样 AgentLoop 不会进入 sticky max-tokens 状态。
 
 ## Follow-up 检测
 
@@ -184,9 +212,10 @@ FOLLOWUP_QUEUED
 Steer 重点标记：
 
 ```text
-STEER_MAX_TOKENS_INTERCEPTED
+STEER_MAX_TOKENS_INTERCEPTED ... policy=discard
+STEER_MAX_TOKENS_INTERCEPTED ... policy=passthrough ... mask=tool-calls
 STEER_QUEUED
-STEER_SEND_SKIPPED reason=native-tool-loop
+STEER_SEND_SKIPPED reason=closed-tool-call
 TURN_END_CAPTURED ... reason=completed
 ```
 
@@ -212,7 +241,8 @@ Smoke test 覆盖：
 
 - Follow-up 保留 max-tokens
 - Steer 将 max-tokens 映射为 stop
-- max-tokens 响应中的 tool-call 全部丢弃
+- `discard`：max-tokens 响应中的 tool-call 全部丢弃
+- `passthrough`：closed tool-call 在 max-tokens 下按 0.4.0 行为保留
 - 正常非截断 tool-calls 原样通过
 - pi-ai replay `length` 同步隐藏
 - Steer 次数上限下仍不向 AgentLoop 暴露 max-tokens
