@@ -1,6 +1,6 @@
 {
   "name": "dsh-continue-on-limit-host",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Host-side global max-tokens auto-continuation for DeepSeek Harness with isolated Follow-up and Steer modes plus DSH 0.1.7 plugin-manager UI.",
   "type": "module",
   "main": "lib/index.js",
