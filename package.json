@@ -1,6 +1,6 @@
 {
   "name": "dsh-continue-on-limit-host",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Host-side global max-tokens auto-continuation for DeepSeek Harness with isolated Follow-up and Steer modes plus DSH 0.1.7 plugin-manager UI.",
   "type": "module",
   "main": "lib/index.js",
@@ -31,13 +31,7 @@
       ]
     },
     "engines": {
-      "dsh": ">=0.1.7-rc.1 <0.2.0"
-    },
-    "compatibility": {
-      "dshReleases": {
-        "0.1.7-rc.1": "compatible",
-        "0.1.7-rc.2": "compatible"
-      }
+      "dsh": ">=0.1.7-rc.1"
     }
   },
   "scripts": {
@@ -48,19 +42,31 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-ui-plugin-manager": ">=0.1.7-rc.1 <0.2.0",
-    "@deepseek-ai/dsh-client-ui-renderer": ">=0.1.7-rc.1 <0.2.0",
-    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.2.0",
-    "@deepseek-ai/dsh-settings": ">=0.1.7-rc.1 <0.2.0",
+    "@deepseek-ai/dsh-client-ui-plugin-manager": ">=0.1.7-rc.1",
+    "@deepseek-ai/dsh-client-ui-renderer": ">=0.1.7-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1",
+    "@deepseek-ai/dsh-settings": ">=0.1.7-rc.1",
     "react": ">=18.2.0"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh-client-ui-plugin-manager": { "optional": true },
-    "@deepseek-ai/dsh-client-ui-renderer": { "optional": true },
-    "@deepseek-ai/dsh-llm": { "optional": true },
-    "@deepseek-ai/dsh-settings": { "optional": true },
-    "react": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-plugin-manager": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-renderer": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
   },
   "repository": {
     "type": "git",
