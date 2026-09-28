@@ -92,6 +92,7 @@ async function hostTests() {
 
   config.debugLogging = true
   max()
+  await Promise.resolve()
   await delay(5)
   if (!logs.some(line => line.includes('TURN_END_CAPTURED') && line.includes('reason=max-tokens'))) {
     throw new Error('debug log did not report TURN_END_CAPTURED max-tokens')
@@ -136,7 +137,9 @@ async function hostTests() {
   config.includeSubagents = true
   config.minIntervalMs = 5000
   max()
-  if (sent.length !== 5) throw new Error('subagent continuation must enqueue synchronously before Activation settlement')
+  if (sent.length !== 4) throw new Error('subagent continuation must not reenter Session.append synchronously')
+  await Promise.resolve()
+  if (sent.length !== 5) throw new Error('subagent continuation must enqueue in the next microtask before Activation settlement')
   config.minIntervalMs = 0
   session.header.origin = undefined
 
