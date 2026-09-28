@@ -55,6 +55,8 @@ Step 2
 
 如果 Step 2 又是 `max-tokens`，插件会再次 Steer；如果最终最新 provider finish 为正常 `stop`，插件允许 Turn 结束。
 
+如果恢复 Step 以 `tool-calls` 结束，DSH 原本应继续下一 Step 读取工具结果；但 Turn 级 sticky `max-tokens` 会让 AgentLoop 在这里提前进入 `agent/turn-stopping`。0.3.2 起，Steer 路径会在这种情况下补一个同 Turn 的 bridge steer，恢复原生工具循环；该 bridge 不计入 `maxConsecutive`。如果工具结果显式携带 `concludesTurn`，则不会 bridge，并把它视为正常终止。
+
 DSH 0.1.7-rc.2 的 AgentLoop 有意把 Turn 级 `max-tokens` 设为 sticky：同一 Turn 中任何 Step 命中过一次 `max-tokens`，后续正常 Step 也不会自动把最终 `turn/end` 降级回 `completed`。
 
 因此 Steer 模式在插件内部额外做一个**仅当前 Session、仅当前恢复 Turn、一次性**的 `session.append` 包装：
@@ -81,7 +83,7 @@ turn-level outcome:
 - 不修改 DSH core 包。
 - 不改全局 `Session.prototype`。
 - 不篡改任何 Assistant stream 中真实的 provider `max-tokens`。
-- 只在插件自己发起的 Steer 恢复链最终正常 stop 时，把 sticky 的 Turn 级结果从 `max-tokens` 归一化成 `completed`。
+- 只在插件自己发起的 Steer 恢复链最终正常 `stop`，或工具显式 `concludesTurn` 时，把 sticky 的 Turn 级结果从 `max-tokens` 归一化成 `completed`。
 - 如果恢复再次截断、达到续写上限、发生错误/取消、用户/其他插件抢占，Turn 仍保留原生结果。
 - 对 Subagent 来说，整个恢复过程留在同一个 Turn/driver 内，不会在中间进入 idle settlement。
 
